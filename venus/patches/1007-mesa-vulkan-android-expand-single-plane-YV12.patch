@@ -1,0 +1,89 @@
+From: caoanhhao <caoanhhao2@gmail.com>
+Subject: [PATCH] vulkan/android: expand single-plane YV12 from gralloc into three planes
+
+minigbm's gbm_mesa backend allocates YV12 (DRM_FORMAT_YVU420_ANDROID) as
+one R8/GR88 block and reports one plane through
+CROS_GRALLOC_DRM_GET_BUFFER_INFO, with drm_fourcc YVU420.  The explicit
+DRM modifier layout then has drmFormatModifierPlaneCount = 1 for
+VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM, and NVIDIA rejects the image with
+VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT.  Under ANGLE every
+eglCreateImageKHR on a software-decoder video frame fails, and
+SurfaceFlinger aborts in AutoBackendTexture::makeImage.
+
+The block holds the Android YV12 layout, so derive V and U from the
+stride and the image height.  Applied on src/mesa venus-vtest after 1004.
+See venus/notes-tiktok.md.
+
+caoanhhao used AI to code
+---
+diff --git a/src/vulkan/runtime/vk_android.c b/src/vulkan/runtime/vk_android.c
+index 7f8ac1e..0bb8394 100644
+--- a/src/vulkan/runtime/vk_android.c
++++ b/src/vulkan/runtime/vk_android.c
+@@ -135,9 +135,36 @@ vk_android_hal_open(const struct hw_module_t *mod, const char *id,
+    return 0;
+ }
+ 
++/* minigbm's gbm_mesa backend allocates YV12 (DRM_FORMAT_YVU420_ANDROID) as
++ * one R8/GR88 block and reports a single plane, while Vulkan needs all three.
++ * The block holds the Android YV12 layout (system/graphics.h): Y with the
++ * buffer's stride, then V and U with stride align(stride / 2, 16) and height
++ * / 2 rows each.
++ */
++static void
++vk_android_expand_single_plane_yv12(struct u_gralloc_buffer_basic_info *info,
++                                    uint32_t height)
++{
++   if (info->drm_fourcc != DRM_FORMAT_YVU420 || info->num_planes != 1 ||
++       !height)
++      return;
++
++   const int y_stride = info->strides[0];
++   const int c_stride = (y_stride / 2 + 15) & ~15;
++   const int c_size = c_stride * (int)(height / 2);
++
++   info->num_planes = 3;
++   for (int i = 1; i < 3; i++) {
++      info->fds[i] = info->fds[0];
++      info->strides[i] = c_stride;
++   }
++   info->offsets[1] = info->offsets[0] + y_stride * (int)height; /* V */
++   info->offsets[2] = info->offsets[1] + c_size;                  /* U */
++}
++
+ static VkResult
+ vk_gralloc_to_drm_explicit_layout(
+-   struct u_gralloc_buffer_handle *in_hnd,
++   struct u_gralloc_buffer_handle *in_hnd, uint32_t height,
+    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+    VkSubresourceLayout *out_layouts, int max_planes)
+ {
+@@ -148,6 +175,8 @@ vk_gralloc_to_drm_explicit_layout(
+    if (u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info) != 0)
+       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+ 
++   vk_android_expand_single_plane_yv12(&info, height);
++
+    if (info.num_planes > max_planes)
+       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+ 
+@@ -292,7 +321,8 @@ vk_android_get_anb_layout(
+       .pixel_stride = native_buffer->stride,
+    };
+ 
+-   return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
++   return vk_gralloc_to_drm_explicit_layout(&gr_handle,
++                                            pCreateInfo->extent.height, out,
+                                             out_layouts, max_planes);
+ }
+ 
+@@ -634,7 +664,8 @@ vk_android_get_ahb_layout(
+       .hal_format = description.format,
+    };
+ 
+-   return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
++   return vk_gralloc_to_drm_explicit_layout(&gr_handle, description.height,
++                                            out,
+                                             out_layouts, max_planes);
+ }
+ 

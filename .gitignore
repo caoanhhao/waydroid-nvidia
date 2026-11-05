@@ -4,5 +4,7 @@
 /release/dist/
 # test binaries and logs
 /venus/tests/build/
+/venus/hwc-yuv/build/
+/venus/hwc-yuv/out/
 # logs and measurement output
 *.txt
