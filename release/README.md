@@ -116,4 +116,10 @@ An app whose old cache was over 512 KiB then crashes before it saves a new one. 
 `--system` scripts now delete `code_cache/com.android.skia.shaders_cache` for every app, and apps
 rebuild them. Details: `venus/notes-blobcache.md`.
 
+Fixed: games that ship only ASTC textures (Delta Force, UE4) crashed at launch. The RTX 4070's
+Vulkan has no ASTC, so every texture failed to load. Venus now emulates ASTC LDR (Mesa patch
+1008): those images are RGBA8 on the host, and uploads are decoded on the CPU. GLES apps
+get ASTC through ANGLE as well. `VN_DEBUG=no_astc_emu` turns it off. Rebuild with
+`build.sh` to pick it up. Details: `venus/notes-deltaforce.md`.
+
 Details: `venus/notes-dmabuf.md`, `HANDOFF.md`, patches in `venus/patches/`.

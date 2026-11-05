@@ -1,0 +1,866 @@
+From: caoanhhao <caoanhhao2@gmail.com>
+Subject: [PATCH] venus: emulate ASTC LDR when the renderer lacks it
+
+Desktop NVIDIA exposes no ASTC (or ETC2) in Vulkan, while Android games
+ship ASTC-only assets: Delta Force (UE4, Android_ASTC paks) fails to load
+every texture and its RenderThread crashes on the null resources.
+
+When the renderer lacks textureCompressionASTC_LDR, advertise it and:
+- report ASTC formats as sampled/transfer-only, from the RGBA8 properties;
+- create ASTC images and views as R8G8B8A8_UNORM/SRGB on the renderer;
+- hide the feature from the renderer in vkCreateDevice;
+- decode buffer-to-image copies on the CPU at record time
+  (_mesa_unpack_astc_2d_ldr) into a per-command-buffer staging buffer.
+
+VN_DEBUG=no_astc_emu turns it off.
+
+caoanhhao used AI to code
+---
+ src/virtio/vulkan/meson.build          |   1 +
+ src/virtio/vulkan/vn_astc.c            | 347 +++++++++++++++++++++++++
+ src/virtio/vulkan/vn_astc.h            |  64 +++++
+ src/virtio/vulkan/vn_buffer.c          |   4 +
+ src/virtio/vulkan/vn_buffer.h          |   6 +
+ src/virtio/vulkan/vn_command_buffer.c  |  58 +++++
+ src/virtio/vulkan/vn_command_buffer.h  |   3 +
+ src/virtio/vulkan/vn_common.c          |   1 +
+ src/virtio/vulkan/vn_common.h          |   1 +
+ src/virtio/vulkan/vn_device.c          |  25 ++
+ src/virtio/vulkan/vn_image.c           |  26 ++
+ src/virtio/vulkan/vn_image.h           |   3 +
+ src/virtio/vulkan/vn_physical_device.c |  43 +++
+ src/virtio/vulkan/vn_physical_device.h |   2 +
+ 14 files changed, 584 insertions(+)
+ create mode 100644 src/virtio/vulkan/vn_astc.c
+ create mode 100644 src/virtio/vulkan/vn_astc.h
+
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index fda382d..13ab792 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -68,6 +68,7 @@ devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
+ 
+ libvn_files = files(
+   'vn_acceleration_structure.c',
++  'vn_astc.c',
+   'vn_buffer.c',
+   'vn_command_buffer.c',
+   'vn_common.c',
+diff --git a/src/virtio/vulkan/vn_astc.c b/src/virtio/vulkan/vn_astc.c
+new file mode 100644
+index 0000000..b40eb4a
+--- /dev/null
++++ b/src/virtio/vulkan/vn_astc.c
+@@ -0,0 +1,347 @@
++/*
++ * Copyright 2026 caoanhhao
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "vn_astc.h"
++
++#include "util/format/u_format.h"
++#include "util/texcompress_astc.h"
++#include "vk_format.h"
++
++#include "vn_buffer.h"
++#include "vn_command_buffer.h"
++#include "vn_device.h"
++#include "vn_device_memory.h"
++#include "vn_image.h"
++#include "vn_physical_device.h"
++#include "vn_renderer.h"
++
++/* staging chunks smaller than this are kept across command buffer resets */
++#define VN_ASTC_STAGING_CHUNK_SIZE (8ull * 1024 * 1024)
++
++struct vn_astc_staging {
++   VkBuffer buffer;
++   VkDeviceMemory memory;
++   uint8_t *ptr;
++   VkDeviceSize size;
++   VkDeviceSize used;
++
++   struct list_head head;
++};
++
++void
++vn_astc_fix_format_properties(VkFormatProperties2 *props2)
++{
++   /* what an ASTC texture is used for: sampling and transfers */
++   const VkFormatFeatureFlags2 allowed =
++      VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
++      VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
++      VK_FORMAT_FEATURE_2_BLIT_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
++      VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
++
++   VkFormatProperties *props = &props2->formatProperties;
++   props->linearTilingFeatures = 0;
++   props->optimalTilingFeatures &= (VkFormatFeatureFlags)allowed;
++   props->bufferFeatures = 0;
++
++   vk_foreach_struct(s, props2->pNext) {
++      switch (s->sType) {
++      case VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3: {
++         VkFormatProperties3 *props3 = (void *)s;
++         props3->linearTilingFeatures = 0;
++         props3->optimalTilingFeatures &= allowed;
++         props3->bufferFeatures = 0;
++         break;
++      }
++      case VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT:
++         ((VkDrmFormatModifierPropertiesListEXT *)s)
++            ->drmFormatModifierCount = 0;
++         break;
++      case VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT:
++         ((VkDrmFormatModifierPropertiesList2EXT *)s)
++            ->drmFormatModifierCount = 0;
++         break;
++      default:
++         break;
++      }
++   }
++}
++
++const VkImageCreateInfo *
++vn_astc_fix_image_create_info(const VkImageCreateInfo *create_info,
++                              struct vn_astc_image_create_info *local_info)
++{
++   local_info->create = *create_info;
++   local_info->create.format = vn_astc_emu_format(create_info->format);
++   local_info->create.flags &=
++      ~(VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
++        VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
++   local_info->create.pNext = NULL;
++
++   /* Only the format list is kept: the other image create structs do not
++    * apply to sampled ASTC images.  A list too long to rewrite is dropped,
++    * which keeps the image mutable to every compatible format.
++    */
++   const VkImageFormatListCreateInfo *list = vk_find_struct_const(
++      create_info->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
++   if (list && list->viewFormatCount &&
++       list->viewFormatCount <= ARRAY_SIZE(local_info->view_formats)) {
++      for (uint32_t i = 0; i < list->viewFormatCount; i++) {
++         const VkFormat format = list->pViewFormats[i];
++         local_info->view_formats[i] =
++            vn_format_is_astc_ldr(format) ? vn_astc_emu_format(format)
++                                          : format;
++      }
++      local_info->format_list = (VkImageFormatListCreateInfo){
++         .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
++         .viewFormatCount = list->viewFormatCount,
++         .pViewFormats = local_info->view_formats,
++      };
++      local_info->create.pNext = &local_info->format_list;
++   }
++
++   return &local_info->create;
++}
++
++static void
++vn_astc_staging_free(struct vn_device *dev, struct vn_astc_staging *staging)
++{
++   VkDevice dev_handle = vn_device_to_handle(dev);
++
++   list_del(&staging->head);
++   vn_DestroyBuffer(dev_handle, staging->buffer, NULL);
++   vn_FreeMemory(dev_handle, staging->memory, NULL);
++   vk_free(&dev->base.vk.alloc, staging);
++}
++
++static struct vn_astc_staging *
++vn_astc_staging_alloc(struct vn_device *dev, VkDeviceSize size)
++{
++   const VkPhysicalDeviceMemoryProperties *mem_props =
++      &dev->physical_device->memory_properties;
++   VkDevice dev_handle = vn_device_to_handle(dev);
++   VkResult result;
++
++   struct vn_astc_staging *staging =
++      vk_zalloc(&dev->base.vk.alloc, sizeof(*staging), VN_DEFAULT_ALIGN,
++                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   if (!staging)
++      return NULL;
++   list_inithead(&staging->head);
++   staging->size = size;
++
++   const VkBufferCreateInfo buf_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = size,
++      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   result = vn_CreateBuffer(dev_handle, &buf_info, NULL, &staging->buffer);
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   const VkBufferMemoryRequirementsInfo2 reqs_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2,
++      .buffer = staging->buffer,
++   };
++   VkMemoryRequirements2 reqs = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
++   };
++   vn_GetBufferMemoryRequirements2(dev_handle, &reqs_info, &reqs);
++
++   const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++   uint32_t mem_type = UINT32_MAX;
++   u_foreach_bit(i, reqs.memoryRequirements.memoryTypeBits) {
++      if ((mem_props->memoryTypes[i].propertyFlags & wanted) == wanted) {
++         mem_type = i;
++         break;
++      }
++   }
++   if (mem_type == UINT32_MAX)
++      goto fail;
++
++   const VkMemoryAllocateInfo mem_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = reqs.memoryRequirements.size,
++      .memoryTypeIndex = mem_type,
++   };
++   result = vn_AllocateMemory(dev_handle, &mem_info, NULL, &staging->memory);
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   const VkBindBufferMemoryInfo bind_info = {
++      .sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
++      .buffer = staging->buffer,
++      .memory = staging->memory,
++   };
++   vn_BindBufferMemory2(dev_handle, 1, &bind_info);
++
++   const VkMemoryMapInfo map_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO,
++      .memory = staging->memory,
++      .size = VK_WHOLE_SIZE,
++   };
++   result = vn_MapMemory2(dev_handle, &map_info, (void **)&staging->ptr);
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   return staging;
++
++fail:
++   if (staging->buffer)
++      vn_DestroyBuffer(dev_handle, staging->buffer, NULL);
++   if (staging->memory)
++      vn_FreeMemory(dev_handle, staging->memory, NULL);
++   vk_free(&dev->base.vk.alloc, staging);
++   return NULL;
++}
++
++/* Returns the CPU address of the buffer contents, or NULL when the buffer is
++ * not bound to memory the guest has mapped.
++ */
++static const uint8_t *
++vn_astc_map_buffer(struct vn_device *dev,
++                   const struct vn_buffer *buf,
++                   VkDeviceSize size)
++{
++   struct vn_device_memory *mem = buf->astc.bound_mem;
++   if (!mem || !mem->base_bo ||
++       buf->astc.bound_offset + size > mem->base.vk.size)
++      return NULL;
++
++   uint8_t *ptr = vn_renderer_bo_map(dev->renderer, mem->base_bo, NULL);
++   if (!ptr)
++      return NULL;
++
++   vn_renderer_bo_invalidate(dev->renderer, mem->base_bo,
++                             buf->astc.bound_offset, size);
++   return ptr + buf->astc.bound_offset;
++}
++
++bool
++vn_astc_decode_copy(struct vn_command_buffer *cmd,
++                    VkBuffer src_buffer,
++                    const struct vn_image *dst_img,
++                    uint32_t region_count,
++                    const VkBufferImageCopy *regions,
++                    VkBuffer *out_buffer,
++                    VkBufferImageCopy *out_regions)
++{
++   struct vn_device *dev = vn_device_from_vk(cmd->base.vk.pool->base.device);
++   const struct vn_buffer *buf = vn_buffer_from_handle(src_buffer);
++   const VkFormat format = dst_img->astc_emu_format;
++   const enum pipe_format pformat = vk_format_to_pipe_format(format);
++   const struct util_format_description *desc =
++      util_format_description(pformat);
++   const uint32_t blk_w = desc->block.width;
++   const uint32_t blk_h = desc->block.height;
++
++   /* source footprint and decoded size of each region */
++   VkDeviceSize src_end = 0;
++   VkDeviceSize dst_size = 0;
++   for (uint32_t i = 0; i < region_count; i++) {
++      const VkBufferImageCopy *r = &regions[i];
++      const uint32_t row_len =
++         r->bufferRowLength ? r->bufferRowLength : r->imageExtent.width;
++      const uint32_t img_h =
++         r->bufferImageHeight ? r->bufferImageHeight : r->imageExtent.height;
++      const uint32_t layers = vk_image_subresource_layer_count(
++         &dst_img->base.vk, &r->imageSubresource);
++      const VkDeviceSize src_stride = DIV_ROUND_UP(row_len, blk_w) * 16;
++      const VkDeviceSize src_layer = DIV_ROUND_UP(img_h, blk_h) * src_stride;
++      const uint32_t depth = MAX2(r->imageExtent.depth, 1) * layers;
++
++      src_end = MAX2(src_end, r->bufferOffset + src_layer * depth);
++      dst_size += align64((VkDeviceSize)r->imageExtent.width *
++                             r->imageExtent.height * 4 * depth,
++                          16);
++   }
++
++   const uint8_t *src = vn_astc_map_buffer(dev, buf, src_end);
++   if (!src) {
++      vn_log(dev->instance, "ASTC upload from an unmapped buffer; skipped");
++      return false;
++   }
++
++   struct vn_astc_staging *staging = NULL;
++   if (!list_is_empty(&cmd->astc_staging)) {
++      staging =
++         list_last_entry(&cmd->astc_staging, struct vn_astc_staging, head);
++      if (staging->size - staging->used < dst_size)
++         staging = NULL;
++   }
++   if (!staging) {
++      staging =
++         vn_astc_staging_alloc(dev, MAX2(dst_size, VN_ASTC_STAGING_CHUNK_SIZE));
++      if (!staging) {
++         cmd->base.vk.state = MESA_VK_COMMAND_BUFFER_STATE_INVALID;
++         return false;
++      }
++      list_addtail(&staging->head, &cmd->astc_staging);
++   }
++
++   VkDeviceSize offset = staging->used;
++   for (uint32_t i = 0; i < region_count; i++) {
++      const VkBufferImageCopy *r = &regions[i];
++      const uint32_t row_len =
++         r->bufferRowLength ? r->bufferRowLength : r->imageExtent.width;
++      const uint32_t img_h =
++         r->bufferImageHeight ? r->bufferImageHeight : r->imageExtent.height;
++      const uint32_t layers = vk_image_subresource_layer_count(
++         &dst_img->base.vk, &r->imageSubresource);
++      const uint32_t width = r->imageExtent.width;
++      const uint32_t height = r->imageExtent.height;
++      const VkDeviceSize src_stride = DIV_ROUND_UP(row_len, blk_w) * 16;
++      const VkDeviceSize src_layer = DIV_ROUND_UP(img_h, blk_h) * src_stride;
++      const VkDeviceSize dst_layer = (VkDeviceSize)width * height * 4;
++      const uint32_t depth = MAX2(r->imageExtent.depth, 1) * layers;
++
++      for (uint32_t z = 0; z < depth; z++) {
++         _mesa_unpack_astc_2d_ldr(staging->ptr + offset + dst_layer * z,
++                                  width * 4,
++                                  src + r->bufferOffset + src_layer * z,
++                                  src_stride, width, height, pformat);
++      }
++
++      out_regions[i] = *r;
++      out_regions[i].bufferOffset = offset;
++      out_regions[i].bufferRowLength = 0;
++      out_regions[i].bufferImageHeight = 0;
++
++      offset += align64(dst_layer * depth, 16);
++   }
++   staging->used = offset;
++
++   *out_buffer = staging->buffer;
++   return true;
++}
++
++void
++vn_astc_cmd_reset(struct vn_command_buffer *cmd)
++{
++   struct vn_device *dev = vn_device_from_vk(cmd->base.vk.pool->base.device);
++   bool kept = false;
++
++   /* keep one default-sized chunk for the next recording */
++   list_for_each_entry_safe(struct vn_astc_staging, staging,
++                            &cmd->astc_staging, head) {
++      if (!kept && staging->size == VN_ASTC_STAGING_CHUNK_SIZE) {
++         staging->used = 0;
++         kept = true;
++         continue;
++      }
++      vn_astc_staging_free(dev, staging);
++   }
++}
++
++void
++vn_astc_cmd_fini(struct vn_command_buffer *cmd)
++{
++   struct vn_device *dev = vn_device_from_vk(cmd->base.vk.pool->base.device);
++
++   list_for_each_entry_safe(struct vn_astc_staging, staging,
++                            &cmd->astc_staging, head)
++      vn_astc_staging_free(dev, staging);
++}
+diff --git a/src/virtio/vulkan/vn_astc.h b/src/virtio/vulkan/vn_astc.h
+new file mode 100644
+index 0000000..11b3e8c
+--- /dev/null
++++ b/src/virtio/vulkan/vn_astc.h
+@@ -0,0 +1,64 @@
++/*
++ * Copyright 2026 caoanhhao
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef VN_ASTC_H
++#define VN_ASTC_H
++
++#include "vn_common.h"
++
++/* ASTC LDR emulation for renderers without textureCompressionASTC_LDR
++ * (e.g. desktop NVIDIA).  Emulated images are created on the renderer as
++ * R8G8B8A8_UNORM/SRGB and buffer-to-image copies are decoded on the CPU at
++ * record time into a per-command-buffer staging buffer.
++ */
++
++struct vn_command_buffer;
++struct vn_image;
++
++static inline bool
++vn_format_is_astc_ldr(VkFormat format)
++{
++   return format >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK &&
++          format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
++}
++
++static inline VkFormat
++vn_astc_emu_format(VkFormat format)
++{
++   /* ASTC UNORM/SRGB formats alternate, UNORM first */
++   return (format - VK_FORMAT_ASTC_4x4_UNORM_BLOCK) & 1
++             ? VK_FORMAT_R8G8B8A8_SRGB
++             : VK_FORMAT_R8G8B8A8_UNORM;
++}
++
++void
++vn_astc_fix_format_properties(VkFormatProperties2 *props);
++
++struct vn_astc_image_create_info {
++   VkImageCreateInfo create;
++   VkImageFormatListCreateInfo format_list;
++   VkFormat view_formats[8];
++};
++
++const VkImageCreateInfo *
++vn_astc_fix_image_create_info(const VkImageCreateInfo *create_info,
++                              struct vn_astc_image_create_info *local_info);
++
++bool
++vn_astc_decode_copy(struct vn_command_buffer *cmd,
++                    VkBuffer src_buffer,
++                    const struct vn_image *dst_img,
++                    uint32_t region_count,
++                    const VkBufferImageCopy *regions,
++                    VkBuffer *out_buffer,
++                    VkBufferImageCopy *out_regions);
++
++void
++vn_astc_cmd_reset(struct vn_command_buffer *cmd);
++
++void
++vn_astc_cmd_fini(struct vn_command_buffer *cmd);
++
++#endif /* VN_ASTC_H */
+diff --git a/src/virtio/vulkan/vn_buffer.c b/src/virtio/vulkan/vn_buffer.c
+index 6ec5953..b3e9ef8 100644
+--- a/src/virtio/vulkan/vn_buffer.c
++++ b/src/virtio/vulkan/vn_buffer.c
+@@ -470,6 +470,10 @@ vn_BindBufferMemory2(VkDevice device,
+                                 pBindInfos);
+ 
+    for (uint32_t i = 0; i < bindInfoCount; i++) {
++      struct vn_buffer *buf = vn_buffer_from_handle(pBindInfos[i].buffer);
++      buf->astc.bound_mem = vn_device_memory_from_handle(pBindInfos[i].memory);
++      buf->astc.bound_offset = pBindInfos[i].memoryOffset;
++
+       const VkBindMemoryStatus *bind_status =
+          vk_find_struct((void *)pBindInfos[i].pNext, BIND_MEMORY_STATUS);
+       if (bind_status)
+diff --git a/src/virtio/vulkan/vn_buffer.h b/src/virtio/vulkan/vn_buffer.h
+index ac46925..780c488 100644
+--- a/src/virtio/vulkan/vn_buffer.h
++++ b/src/virtio/vulkan/vn_buffer.h
+@@ -49,6 +49,12 @@ struct vn_buffer {
+       /* buffer is prime blit dst */
+       struct vn_device_memory *mem;
+    } wsi;
++
++   /* bound memory, for reading ASTC uploads on the CPU (see vn_astc.c) */
++   struct {
++      struct vn_device_memory *bound_mem;
++      VkDeviceSize bound_offset;
++   } astc;
+ };
+ VK_DEFINE_NONDISP_HANDLE_CASTS(vn_buffer,
+                                base.vk,
+diff --git a/src/virtio/vulkan/vn_command_buffer.c b/src/virtio/vulkan/vn_command_buffer.c
+index 5538767..c2b1c2f 100644
+--- a/src/virtio/vulkan/vn_command_buffer.c
++++ b/src/virtio/vulkan/vn_command_buffer.c
+@@ -17,6 +17,7 @@
+ #include "vn_descriptor_set.h"
+ #include "vn_device.h"
+ #include "vn_feedback.h"
++#include "vn_astc.h"
+ #include "vn_image.h"
+ #include "vn_physical_device.h"
+ #include "vn_query_pool.h"
+@@ -743,6 +744,8 @@ vn_cmd_reset(struct vn_command_buffer *cmd)
+       vn_query_feedback_cmd_free(cmd->linked_qfb_cmd);
+       cmd->linked_qfb_cmd = NULL;
+    }
++
++   vn_astc_cmd_reset(cmd);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -823,6 +826,7 @@ vn_cmd_destroy(struct vk_command_buffer *cmd_vk)
+ {
+    struct vn_command_buffer *cmd = vn_cmd_from_vk(cmd_vk);
+    vn_cmd_reset(cmd);
++   vn_astc_cmd_fini(cmd);
+    vn_cs_encoder_fini(&cmd->cs);
+    vn_command_buffer_base_fini(&cmd->base);
+    vk_free(&cmd_vk->pool->alloc, cmd);
+@@ -866,6 +870,7 @@ vn_AllocateCommandBuffers(VkDevice device,
+                          VN_CS_ENCODER_STORAGE_SHMEM_POOL, 16 * 1024);
+ 
+       list_inithead(&cmd->builder.query_records);
++      list_inithead(&cmd->astc_staging);
+ 
+       VkCommandBuffer cmd_handle = vn_command_buffer_to_handle(cmd);
+       pCommandBuffers[i] = cmd_handle;
+@@ -899,6 +904,7 @@ vn_FreeCommandBuffers(VkDevice device,
+          continue;
+ 
+       vn_cmd_reset(cmd);
++      vn_astc_cmd_fini(cmd);
+       vn_cs_encoder_fini(&cmd->cs);
+       vn_command_buffer_base_fini(&cmd->base);
+       vk_free(alloc, cmd);
+@@ -1457,6 +1463,31 @@ vn_CmdBlitImage2(VkCommandBuffer commandBuffer,
+    VN_CMD_ENQUEUE(vkCmdBlitImage2, commandBuffer, pBlitImageInfo);
+ }
+ 
++/* The renderer image of an emulated ASTC image is RGBA8: decode the blocks
++ * into a staging buffer and copy from there instead.
++ */
++static void
++vn_cmd_copy_buffer_to_astc_image(VkCommandBuffer commandBuffer,
++                                 VkBuffer srcBuffer,
++                                 VkImage dstImage,
++                                 VkImageLayout dstImageLayout,
++                                 uint32_t regionCount,
++                                 const VkBufferImageCopy *pRegions)
++{
++   struct vn_command_buffer *cmd =
++      vn_command_buffer_from_handle(commandBuffer);
++   const struct vn_image *img = vn_image_from_handle(dstImage);
++
++   STACK_ARRAY(VkBufferImageCopy, regions, regionCount);
++   VkBuffer staging;
++   if (vn_astc_decode_copy(cmd, srcBuffer, img, regionCount, pRegions,
++                           &staging, regions)) {
++      VN_CMD_ENQUEUE(vkCmdCopyBufferToImage, commandBuffer, staging,
++                     dstImage, dstImageLayout, regionCount, regions);
++   }
++   STACK_ARRAY_FINISH(regions);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ vn_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
+                         VkBuffer srcBuffer,
+@@ -1465,6 +1496,12 @@ vn_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
+                         uint32_t regionCount,
+                         const VkBufferImageCopy *pRegions)
+ {
++   if (unlikely(vn_image_from_handle(dstImage)->astc_emu_format)) {
++      vn_cmd_copy_buffer_to_astc_image(commandBuffer, srcBuffer, dstImage,
++                                       dstImageLayout, regionCount, pRegions);
++      return;
++   }
++
+    VN_CMD_ENQUEUE(vkCmdCopyBufferToImage, commandBuffer, srcBuffer, dstImage,
+                   dstImageLayout, regionCount, pRegions);
+ }
+@@ -1474,6 +1511,27 @@ vn_CmdCopyBufferToImage2(
+    VkCommandBuffer commandBuffer,
+    const VkCopyBufferToImageInfo2 *pCopyBufferToImageInfo)
+ {
++   const VkCopyBufferToImageInfo2 *info = pCopyBufferToImageInfo;
++   if (unlikely(vn_image_from_handle(info->dstImage)->astc_emu_format)) {
++      STACK_ARRAY(VkBufferImageCopy, regions, info->regionCount);
++      for (uint32_t i = 0; i < info->regionCount; i++) {
++         const VkBufferImageCopy2 *r = &info->pRegions[i];
++         regions[i] = (VkBufferImageCopy){
++            .bufferOffset = r->bufferOffset,
++            .bufferRowLength = r->bufferRowLength,
++            .bufferImageHeight = r->bufferImageHeight,
++            .imageSubresource = r->imageSubresource,
++            .imageOffset = r->imageOffset,
++            .imageExtent = r->imageExtent,
++         };
++      }
++      vn_cmd_copy_buffer_to_astc_image(commandBuffer, info->srcBuffer,
++                                       info->dstImage, info->dstImageLayout,
++                                       info->regionCount, regions);
++      STACK_ARRAY_FINISH(regions);
++      return;
++   }
++
+    VN_CMD_ENQUEUE(vkCmdCopyBufferToImage2, commandBuffer,
+                   pCopyBufferToImageInfo);
+ }
+diff --git a/src/virtio/vulkan/vn_command_buffer.h b/src/virtio/vulkan/vn_command_buffer.h
+index a5099e9..2d4baa4 100644
+--- a/src/virtio/vulkan/vn_command_buffer.h
++++ b/src/virtio/vulkan/vn_command_buffer.h
+@@ -77,6 +77,9 @@ struct vn_command_buffer {
+    struct vn_command_buffer_builder builder;
+ 
+    struct vn_query_feedback_cmd *linked_qfb_cmd;
++
++   /* staging buffers holding decoded ASTC uploads, see vn_astc.c */
++   struct list_head astc_staging;
+ };
+ VK_DEFINE_HANDLE_CASTS(vn_command_buffer,
+                        base.vk.base,
+diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
+index fe9c375..8ce9fcf 100644
+--- a/src/virtio/vulkan/vn_common.c
++++ b/src/virtio/vulkan/vn_common.c
+@@ -37,6 +37,7 @@ static const struct debug_control vn_debug_options[] = {
+    { "mem_budget", VN_DEBUG_MEM_BUDGET },
+    { "no_desc_heap", VN_DEBUG_NO_DESC_HEAP },
+    { "no_drm_syncobj", VN_DEBUG_NO_DRM_SYNCOBJ },
++   { "no_astc_emu", VN_DEBUG_NO_ASTC_EMU },
+    { NULL, 0 },
+    /* clang-format on */
+ };
+diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
+index 86235f6..0f2adc2 100644
+--- a/src/virtio/vulkan/vn_common.h
++++ b/src/virtio/vulkan/vn_common.h
+@@ -130,6 +130,7 @@ enum vn_debug {
+    VN_DEBUG_MEM_BUDGET = 1ull << 11,
+    VN_DEBUG_NO_DESC_HEAP = 1ull << 12,
+    VN_DEBUG_NO_DRM_SYNCOBJ = 1ull << 13,
++   VN_DEBUG_NO_ASTC_EMU = 1ull << 14,
+ };
+ 
+ enum vn_perf {
+diff --git a/src/virtio/vulkan/vn_device.c b/src/virtio/vulkan/vn_device.c
+index 31cfdc2..6a4ddb5 100644
+--- a/src/virtio/vulkan/vn_device.c
++++ b/src/virtio/vulkan/vn_device.c
+@@ -506,6 +506,28 @@ vn_device_init(struct vn_device *dev,
+          break;
+       }
+    }
++
++   /* ASTC is emulated (see vn_astc.c): hide the feature from the renderer.
++    * A chained VkPhysicalDeviceFeatures2 is patched in place for the
++    * duration of the call, since the chain cannot be rebuilt here.
++    */
++   VkPhysicalDeviceFeatures astc_feats;
++   VkPhysicalDeviceFeatures2 *astc_feats2 = NULL;
++   if (physical_dev->emulate_astc) {
++      if (final_create_info.pEnabledFeatures &&
++          final_create_info.pEnabledFeatures->textureCompressionASTC_LDR) {
++         astc_feats = *final_create_info.pEnabledFeatures;
++         astc_feats.textureCompressionASTC_LDR = VK_FALSE;
++         final_create_info.pEnabledFeatures = &astc_feats;
++      }
++      astc_feats2 = (VkPhysicalDeviceFeatures2 *)vk_find_struct_const(
++         final_create_info.pNext, PHYSICAL_DEVICE_FEATURES_2);
++      if (astc_feats2 && astc_feats2->features.textureCompressionASTC_LDR)
++         astc_feats2->features.textureCompressionASTC_LDR = VK_FALSE;
++      else
++         astc_feats2 = NULL;
++   }
++
+    result = vn_call_vkCreateDevice(dev->primary_ring, physical_dev_handle,
+                                    &final_create_info, NULL, &dev_handle);
+ 
+@@ -544,6 +566,9 @@ vn_device_init(struct vn_device *dev,
+    }
+    STACK_ARRAY_FINISH(queue_infos);
+ 
++   if (astc_feats2)
++      astc_feats2->features.textureCompressionASTC_LDR = VK_TRUE;
++
+    /* free the fixed extensions here since no longer needed below */
+    if (create_info == &local_create_info)
+       vk_free(alloc, (void *)create_info->ppEnabledExtensionNames);
+diff --git a/src/virtio/vulkan/vn_image.c b/src/virtio/vulkan/vn_image.c
+index 5d4f916..d3bcb23 100644
+--- a/src/virtio/vulkan/vn_image.c
++++ b/src/virtio/vulkan/vn_image.c
+@@ -17,6 +17,7 @@
+ #include "vk_format.h"
+ 
+ #include "vn_android.h"
++#include "vn_astc.h"
+ #include "vn_device.h"
+ #include "vn_device_memory.h"
+ #include "vn_physical_device.h"
+@@ -606,7 +607,16 @@ vn_CreateImage(VkDevice device,
+             pCreateInfo, renderer_handle_type, &local_info);
+       }
+ 
++      const VkFormat app_format = pCreateInfo->format;
++      struct vn_astc_image_create_info astc_info;
++      const bool astc_emu = dev->physical_device->emulate_astc &&
++                            vn_format_is_astc_ldr(app_format);
++      if (astc_emu)
++         pCreateInfo = vn_astc_fix_image_create_info(pCreateInfo, &astc_info);
++
+       result = vn_image_create(dev, pCreateInfo, alloc, &img);
++      if (result == VK_SUCCESS && astc_emu)
++         img->astc_emu_format = app_format;
+    }
+ 
+    if (result != VK_SUCCESS)
+@@ -818,6 +828,11 @@ vn_CreateImageView(VkDevice device,
+       pCreateInfo = &local_info;
+ 
+       assert(pCreateInfo->format != VK_FORMAT_UNDEFINED);
++   } else if (img->astc_emu_format &&
++              vn_format_is_astc_ldr(pCreateInfo->format)) {
++      local_info = *pCreateInfo;
++      local_info.format = vn_astc_emu_format(pCreateInfo->format);
++      pCreateInfo = &local_info;
+    }
+ 
+    struct vn_image_view *view =
+@@ -983,6 +998,17 @@ vn_GetDeviceImageMemoryRequirements(
+ {
+    struct vn_device *dev = vn_device_from_handle(device);
+ 
++   if (dev->physical_device->emulate_astc &&
++       vn_format_is_astc_ldr(pInfo->pCreateInfo->format)) {
++      struct vn_astc_image_create_info astc_info;
++      VkDeviceImageMemoryRequirements local_info = *pInfo;
++      local_info.pCreateInfo =
++         vn_astc_fix_image_create_info(pInfo->pCreateInfo, &astc_info);
++      vn_GetDeviceImageMemoryRequirements(device, &local_info,
++                                          pMemoryRequirements);
++      return;
++   }
++
+    uint8_t key[BLAKE3_KEY_LEN] = { 0 };
+    const bool cacheable =
+       vn_image_get_image_reqs_key(dev, pInfo->pCreateInfo, key);
+diff --git a/src/virtio/vulkan/vn_image.h b/src/virtio/vulkan/vn_image.h
+index 74bdeed..549c814 100644
+--- a/src/virtio/vulkan/vn_image.h
++++ b/src/virtio/vulkan/vn_image.h
+@@ -53,6 +53,9 @@ struct vn_image {
+    bool deferred;
+    bool deferred_initialized;
+ 
++   /* the app format of an ASTC image emulated as RGBA8, see vn_astc.c */
++   VkFormat astc_emu_format;
++
+    struct {
+       bool is_prime_blit_src;
+ 
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index 04a9be5..9b1001a 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -20,6 +20,7 @@
+ #include "vk_common_entrypoints.h"
+ 
+ #include "vn_android.h"
++#include "vn_astc.h"
+ #include "vn_instance.h"
+ 
+ #define IMAGE_FORMAT_CACHE_MAX_ENTRIES 100
+@@ -431,6 +432,14 @@ vn_physical_device_init_features(struct vn_physical_device *physical_dev)
+     */
+    feats->deviceMemoryReport = true;
+ 
++   /* Android games ship ASTC-only assets (e.g. UE4 Android_ASTC paks) and
++    * fail to load any texture without it.  See vn_astc.c.
++    */
++   if (!feats->textureCompressionASTC_LDR && !VN_DEBUG(NO_ASTC_EMU)) {
++      feats->textureCompressionASTC_LDR = true;
++      physical_dev->emulate_astc = true;
++   }
++
+    /* VK_EXT_map_memory_placed */
+    if (supported_exts->EXT_map_memory_placed) {
+       feats->memoryMapPlaced = true;
+@@ -2173,6 +2182,13 @@ vn_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
+    VkFormatProperties3 *props3 = NULL;
+    VkBool32 *srpq = NULL;
+ 
++   if (physical_dev->emulate_astc && vn_format_is_astc_ldr(format)) {
++      vn_GetPhysicalDeviceFormatProperties2(
++         physicalDevice, vn_astc_emu_format(format), pFormatProperties);
++      vn_astc_fix_format_properties(pFormatProperties);
++      return;
++   }
++
+    bool cacheable = true;
+    uint64_t key = (uint64_t)format;
+    vk_foreach_struct_const(src, pFormatProperties->pNext) {
+@@ -2713,6 +2729,33 @@ vn_GetPhysicalDeviceImageFormatProperties2(
+    const VkExternalMemoryHandleTypeFlags supported_handle_types =
+       physical_dev->external_memory.supported_handle_types;
+ 
++   if (physical_dev->emulate_astc &&
++       vn_format_is_astc_ldr(pImageFormatInfo->format)) {
++      const VkImageUsageFlags astc_usage = VK_IMAGE_USAGE_SAMPLED_BIT |
++                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                                           VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++      const VkImageCreateFlags astc_flags =
++         VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
++         VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
++      if (pImageFormatInfo->type != VK_IMAGE_TYPE_2D ||
++          pImageFormatInfo->tiling != VK_IMAGE_TILING_OPTIMAL ||
++          (pImageFormatInfo->usage & ~astc_usage) ||
++          (pImageFormatInfo->flags & ~astc_flags) ||
++          vk_find_struct_const(pImageFormatInfo->pNext,
++                               PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO)) {
++         return vn_error(physical_dev->instance,
++                         VK_ERROR_FORMAT_NOT_SUPPORTED);
++      }
++
++      VkPhysicalDeviceImageFormatInfo2 astc_info = *pImageFormatInfo;
++      astc_info.format = vn_astc_emu_format(pImageFormatInfo->format);
++      VkResult result = vn_GetPhysicalDeviceImageFormatProperties2(
++         physicalDevice, &astc_info, pImageFormatProperties);
++      pImageFormatProperties->imageFormatProperties.sampleCounts =
++         VK_SAMPLE_COUNT_1_BIT;
++      return result;
++   }
++
+    const struct wsi_image_create_info *wsi_info = vk_find_struct_const(
+       pImageFormatInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
+    if (wsi_info &&
+diff --git a/src/virtio/vulkan/vn_physical_device.h b/src/virtio/vulkan/vn_physical_device.h
+index d812f4d..f557ed8 100644
+--- a/src/virtio/vulkan/vn_physical_device.h
++++ b/src/virtio/vulkan/vn_physical_device.h
+@@ -110,6 +110,8 @@ struct vn_physical_device {
+     * Android 14+ UI framework and it does not handle wait-before-signal.
+     */
+    int emulate_second_queue;
++   /* ASTC LDR is emulated as RGBA8 when the renderer lacks it */
++   bool emulate_astc;
+ 
+    VkPhysicalDeviceMemoryProperties memory_properties;
+ 
+-- 
+2.56.0
+
