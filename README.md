@@ -1,9 +1,10 @@
-# Waydroid trên NVIDIA (Venus qua vtest)
+# Waydroid on NVIDIA (Venus over vtest)
 
-Chạy Waydroid với tăng tốc GPU trên card NVIDIA. Driver `nvidia-open` của host vẫn giữ nguyên:
-không cần nouveau, không cần gỡ driver NVIDIA.
+Run Waydroid with GPU acceleration on an NVIDIA card. The host keeps its `nvidia-open` driver:
+no nouveau, no need to remove the NVIDIA driver.
 
-Android không nạp được driver NVIDIA (vốn viết cho glibc), nên lệnh Vulkan được chuyển ra host:
+Android cannot load the NVIDIA driver (it is built for glibc), so Vulkan commands are forwarded
+to the host:
 
 ```
 App / SurfaceFlinger (Android)
@@ -11,195 +12,200 @@ App / SurfaceFlinger (Android)
   └─ OpenGL ES: ANGLE → Venus
         │  unix socket /data/vtest/vtest.sock
         ▼
-virgl_test_server (host, đã vá, vtest v6)  ← dịch vụ systemd user `waydroid-vtest`
+virgl_test_server (host, patched, vtest v6)  ← systemd user service `waydroid-vtest`
         ▼
 NVIDIA Vulkan (nvidia-open) → RTX 4070 → Hyprland
 ```
 
-Buffer cửa sổ do NVIDIA cấp phát trên host (định dạng block-linear) rồi chuyển vào Android
-qua vtest. Nhờ vậy Hyprland hiển thị trực tiếp, không phải chép lại.
+Window buffers are allocated by NVIDIA on the host (block-linear format) and passed into Android
+through vtest. Hyprland shows them directly, without a copy.
 
-## Yêu cầu
+## Requirements
 
-| Thành phần | Đã thử với |
+| Component | Tested with |
 |---|---|
-| Hệ điều hành | Arch Linux, kernel 7.2 |
-| GPU NVIDIA | RTX 4070, `nvidia-open` 615.78.08, render node `/dev/dri/renderD129` |
-| iGPU Intel | UHD 770, `/dev/dri/renderD128`, dùng cho buffer CPU (LINEAR) |
+| OS | Arch Linux, kernel 7.2 |
+| NVIDIA GPU | RTX 4070, `nvidia-open` 615.78.08, render node `/dev/dri/renderD129` |
+| Intel iGPU | UHD 770, `/dev/dri/renderD128`, used for CPU buffers (LINEAR) |
 | Compositor | Hyprland 0.57 (Wayland) |
-| Waydroid | 1.6.3, image LineageOS 20 (Android 13) x86_64, có sẵn ANGLE trong vendor |
+| Waydroid | 1.6.3, LineageOS 20 (Android 13) x86_64 image, with ANGLE in vendor |
 
-Cần cả iGPU Intel: các buffer CPU đọc/ghi (con trỏ, chụp màn hình…) vẫn cấp phát trên Intel.
+The Intel iGPU is required too: buffers the CPU reads or writes (cursor, screenshots…) are still
+allocated on Intel.
 
-Kiểm tra số render node của máy bạn:
+Check your machine's render node numbers:
 
 ```bash
 ls -l /dev/dri/by-path/
 ```
 
-Nếu số khác `renderD128` (Intel) / `renderD129` (NVIDIA), sửa trong
-`release/waydroid-vtest.service` (`--rendernode`) và `release/install.sh` (`gralloc.gbm.device`)
-trước khi cài.
+If they differ from `renderD128` (Intel) / `renderD129` (NVIDIA), edit
+`release/waydroid-vtest.service` (`--rendernode`) and `release/install.sh` (`gralloc.gbm.device`)
+before installing.
 
-## Cài đặt
+## Install
 
-### Cách 1: dùng bản đã build sẵn (`release/dist/`)
+### Option 1: use the prebuilt files (`release/dist/`)
 
-Nếu `release/dist/` đã có file (xem `release/dist/VERSION`), chỉ cần hai bước.
+If `release/dist/` already has files (see `release/dist/VERSION`), two steps are enough.
 
-1. Phần host, chạy với user thường, không sudo. Bước này cài server vào
-   `~/.local/lib/waydroid-venus`, bật dịch vụ `waydroid-vtest`, và tự tắt Waydroid nếu nó đang chạy.
+1. Host part, as your normal user, without sudo. This installs the server into
+   `~/.local/lib/waydroid-venus`, enables the `waydroid-vtest` service, and stops Waydroid if it
+   is running.
 
    ```bash
    sh release/install.sh
    ```
 
-2. Phần Android, cần sudo. Bước này chép driver và gralloc shim vào overlay của Waydroid, đặt các
-   prop trong `/var/lib/waydroid/waydroid.cfg`, rồi khởi động lại `waydroid-container`.
+2. Android part, with sudo. This copies the driver and the gralloc shim into the Waydroid
+   overlay, sets the properties in `/var/lib/waydroid/waydroid.cfg`, and restarts
+   `waydroid-container`.
 
    ```bash
    sudo sh release/install.sh --system
    ```
 
-### Cách 2: build từ mã nguồn
+### Option 2: build from source
 
-Cần thêm: Android NDK r30, `meson`, `ninja`, `git`, gcc trên host.
+Also needed: Android NDK r30, `meson`, `ninja`, `git`, and gcc on the host.
 
-| Phần | Script | Mã nguồn |
+| Part | Script | Source |
 |---|---|---|
-| Venus cho Android | `venus/build-venus-android.sh` | `src/mesa`, nhánh `venus-vtest` |
-| Server cho host | `venus/build-virglrenderer-host.sh` | `src/virglrenderer`, nhánh `vtest-dmabuf` |
+| Venus for Android | `venus/build-venus-android.sh` | `src/mesa`, branch `venus-vtest` |
+| Host server | `venus/build-virglrenderer-host.sh` | `src/virglrenderer`, branch `vtest-dmabuf` |
 | Gralloc shim | `src/minigbm-vtest/build-android.sh` | `src/minigbm-vtest` |
-| Wrapper Intel LINEAR | `src/minigbm-wrapper/build.sh` | `src/minigbm-wrapper` |
+| Intel LINEAR wrapper | `src/minigbm-wrapper/build.sh` | `src/minigbm-wrapper` |
+| hwcomposer format shim | `venus/hwc-yuv/build.sh` | `venus/hwc-yuv` |
 
-Build cả bốn phần:
+Build all parts:
 
 ```bash
-sh venus/build-venus-android.sh && sh venus/build-virglrenderer-host.sh && sh src/minigbm-vtest/build-android.sh && sh src/minigbm-wrapper/build.sh
+sh venus/build-venus-android.sh && sh venus/build-virglrenderer-host.sh && sh src/minigbm-vtest/build-android.sh && sh src/minigbm-wrapper/build.sh && sh venus/hwc-yuv/build.sh
 ```
 
-Gom kết quả vào `release/dist/`. Lệnh này cũng ghi `VERSION` và `SHA256SUMS`.
+Collect the results into `release/dist/`. This also writes `VERSION` and `SHA256SUMS`.
 
 ```bash
 sh release/build.sh
 ```
 
-Sau đó cài như Cách 1. Các patch nằm trong `venus/patches/`, nếu cần áp lại lên mã nguồn gốc.
+Then install as in Option 1. The patches are in `venus/patches/` if you need to apply them to the
+upstream sources again.
 
-## Sử dụng hằng ngày
+## Daily use
 
-Dùng Waydroid như bình thường: không còn script nào phải chạy tay.
+Use Waydroid as usual: there are no scripts to run by hand.
 
-- **Mở:** từ menu ứng dụng, hoặc:
+- **Start:** from the app menu, or:
 
   ```bash
   waydroid show-full-ui
   ```
 
-- **Tắt:**
+- **Stop:**
 
   ```bash
   waydroid session stop
   ```
 
-- Dịch vụ `waydroid-vtest` tự chạy khi bạn đăng nhập và tự khởi động lại nếu bị lỗi.
+- The `waydroid-vtest` service starts when you log in and restarts itself if it fails.
 
-### Kiểm tra đang chạy trên NVIDIA
+### Check that it runs on NVIDIA
 
-Dịch vụ phải ở trạng thái `active (running)`:
+The service must be `active (running)`:
 
 ```bash
 systemctl --user status waydroid-vtest
 ```
 
-Ứng dụng Android phải vẽ bằng Vulkan:
+Android apps must draw with Vulkan:
 
 ```bash
 sudo waydroid shell -- dumpsys gfxinfo com.android.systemui | grep Pipeline
 ```
 
-Kết quả mong đợi: `Pipeline=Skia (Vulkan)`.
+Expected output: `Pipeline=Skia (Vulkan)`.
 
-`nvidia-smi` phải liệt kê `virgl_test_server` và `virgl_render_server`:
+`nvidia-smi` must list `virgl_test_server` and `virgl_render_server`:
 
 ```bash
 nvidia-smi | grep virgl
 ```
 
-## Xử lý sự cố
+## Troubleshooting
 
-| Triệu chứng | Cách xử lý |
+| Symptom | Fix |
 |---|---|
-| Cửa sổ đen, kẹt ở boot animation, hoặc log có `no suitable EGLConfig found` / `!gpuCount` | Server chưa chạy lúc Android khởi động. Chạy lại server, rồi tắt và mở lại Waydroid (lệnh bên dưới). |
-| Vừa khởi động lại `waydroid-vtest` trong lúc Waydroid đang chạy | Android mất kết nối GPU. Luôn tắt và mở lại Waydroid sau khi khởi động lại dịch vụ. |
-| Không thấy con trỏ chuột trên cửa sổ Waydroid | Lỗi đã biết, xem bên dưới. Chuột vẫn bấm được. |
-| Cần log | Xem các lệnh log bên dưới. |
+| Black window, stuck at the boot animation, or `no suitable EGLConfig found` / `!gpuCount` in the log | The server was not running when Android started. Restart the server, then stop and start Waydroid (command below). |
+| `waydroid-vtest` was restarted while Waydroid was running | Android lost its GPU connection. Always stop and start Waydroid after restarting the service. |
+| Need logs | See the log commands below. |
 
-Chạy lại server rồi mở lại Waydroid:
+Restart the server and reopen Waydroid:
 
 ```bash
 systemctl --user restart waydroid-vtest && waydroid session stop && waydroid show-full-ui
 ```
 
-Log của server:
+Server log:
 
 ```bash
 journalctl --user -u waydroid-vtest -e
 ```
 
-Log của Android:
+Android crash log:
 
 ```bash
 sudo waydroid shell -- logcat -d -b crash
 ```
 
-Danh sách tombstone:
+List of tombstones:
 
 ```bash
 sudo waydroid shell -- ls -l /data/tombstones
 ```
 
-## Gỡ cài đặt (quay về OpenGL trên Intel)
+## Uninstall (back to OpenGL on Intel)
 
-1. Phần Android:
+1. Android part:
 
    ```bash
    sudo sh release/uninstall.sh --system
    ```
 
-2. Phần host:
+2. Host part:
 
    ```bash
    sh release/uninstall.sh
    ```
 
-Waydroid sẽ quay về cấu hình Intel (`ro.hardware.egl = mesa`). Bản sao cấu hình gốc trước mọi
-thay đổi nằm trong `backups/`.
+Waydroid goes back to the Intel setup (`ro.hardware.egl = mesa`). Copies of the original
+configuration, from before any change, are in `backups/`.
 
-## Hạn chế đã biết
+## Known limitations
 
-- **Con trỏ chuột có thể không hiện.** Prop `persist.waydroid.cursor_force_shm = true` tránh
-  được lỗi crash của hwcomposer, nhưng buffer con trỏ là buffer LINEAR của Intel, và Hyprland
-  trên NVIDIA không hiển thị được loại này. Đang được sửa: nguyên nhân là ANGLE không tìm thấy
-  `libnativewindow` trong hwcomposer.
-- **Đồng bộ GPU bằng CPU.** Log có `failed to dup EGL native fence sync` ở mỗi frame, vì vtest
-  chưa truyền fence thật. Hiệu năng chưa được đo. Đang được sửa bằng giao thức vtest v7.
-- **Chỉ chế độ toàn màn hình (full UI) đã được thử.** Chế độ multi-window dùng đường EGL của
-  hwcomposer nên có thể crash.
-- **Ứng dụng OpenGL ES nặng (game) chưa được thử kỹ.** Ứng dụng dùng native bridge
-  (`libhoudini`) có thể crash vì lý do riêng.
-- **Server là bản vá riêng (vtest v6),** không dùng `virgl_test_server` của hệ thống.
-  Không ghi đè lên `/usr/lib/virgl_render_server`.
+- **GPU sync is done on the CPU.** `failed to dup EGL native fence sync` is logged on every
+  frame, because vtest does not pass real fences yet. Performance has not been measured. A fix
+  through vtest protocol v7 is in progress.
+- **Only full-UI mode has been tested.** Multi-window mode has not been tried.
+- **Heavy OpenGL ES apps (games) are not well tested.** Apps that use the native bridge
+  (`libhoudini`) can crash for their own reasons; TikTok's `libhoudini` crash is one of them
+  (`venus/notes-tiktok.md`).
+- **The server is a separately patched build (vtest v6),** not the system `virgl_test_server`.
+  It does not overwrite `/usr/lib/virgl_render_server`.
 
-## Cấu trúc thư mục
+Fixed issues (the mouse cursor, video apps such as TikTok, the Play Store crash) are described
+in `release/README.md`.
 
-| Đường dẫn | Nội dung |
+## Layout
+
+| Path | Contents |
 |---|---|
 | `release/` | `build.sh`, `install.sh`, `uninstall.sh`, `waydroid-vtest.service`, `dist/` |
-| `release/README.md` | Ghi chú kỹ thuật của bản release (tiếng Anh) |
-| `venus/patches/` | Các patch cho Mesa, virglrenderer và minigbm |
-| `venus/notes-*.md` | Ghi chép chẩn đoán từng vấn đề |
-| `venus/tests/` | Chương trình thử trên host và bên trong Android |
-| `src/` | Mã nguồn đã vá (Mesa, virglrenderer, minigbm shim/wrapper) |
-| `HANDOFF.md`, `plan.md` | Lịch sử và kế hoạch của dự án |
-| `backups/` | Cấu hình Waydroid gốc |
+| `release/README.md` | Technical notes for the release |
+| `venus/patches/` | Patches for Mesa, virglrenderer and minigbm |
+| `venus/notes-*.md` | Diagnosis notes, one per issue |
+| `venus/hwc-yuv/` | hwcomposer format shim and the YV12 import test |
+| `venus/tests/` | Test programs for the host and inside Android |
+| `src/` | Patched sources (Mesa, virglrenderer, minigbm shim/wrapper) |
+| `HANDOFF.md`, `plan.md` | Project history and plan |
+| `backups/` | Original Waydroid configuration |
