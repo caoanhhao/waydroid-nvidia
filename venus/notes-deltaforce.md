@@ -88,3 +88,31 @@ This also changes ANGLE: GLES apps now see `GL_KHR_texture_compression_astc_ldr`
   `adb shell settings put secure assistant ""` turns the assistant off.
 - `release/dist` still holds the old driver until `sh release/build.sh` and both
   install steps run.
+
+## Login: the game refuses emulators (no fix)
+
+The Login screen renders at 25 fps and keeps window focus. Two things happened
+there:
+
+- Mouse clicks do nothing. Waydroid's `wayland_pointer` sends `SOURCE_MOUSE`
+  (0x2002) events, and this UE4 build only handles touch:
+  `adb shell input mouse tap` changes nothing, `input touchscreen tap` works.
+  Waydroid can turn mouse input into touch for a package:
+  `waydroid prop set persist.waydroid.fake_touch com.garena.game.df`.
+- With touch, pressing a login button (here the "..." more-logins button,
+  `OnThirdPartLoginBtnClick`) shows "For fair play, avoid using emulators.
+  Download the PC client at df.qq.com." with only EXIT GAME. The UE4 log says why:
+
+  ```
+  LuaMLogin: Error: [LoginUtil] GetClientType emulatorName:TencentAoYYB
+  LuaMLogin: Error: [LoginInterface][OnThirdPartLoginBtnClick] is simulator
+  ```
+
+  This is the game's own policy check before login (it classifies the client as an
+  emulator). It is not a GPU, driver or network failure. Getting around it would
+  mean defeating the game's emulator and anti-cheat detection, so this project
+  does not do that. The mobile build of Delta Force cannot be logged into from
+  Waydroid. Use the PC client.
+
+The ASTC emulation (patch 1008) is still worth keeping: it fixes the launch
+crash and benefits other ASTC-only games and GLES apps.
