@@ -1,0 +1,52 @@
+From fabef7c1b588db26d1404f8fff60dec1ed784928 Mon Sep 17 00:00:00 2001
+From: caoanhhao <caoanhhao2@gmail.com>
+Date: Thu, 5 Nov 2026 12:40:32 +0700
+Subject: [PATCH] venus/android: accept linear tiling in AHB image format
+ queries
+
+ANGLE creates its Vulkan image for an AHardwareBuffer with
+VK_IMAGE_TILING_LINEAR whenever the buffer has CPU read/write usage,
+and fails eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID) with
+EGL_BAD_PARAMETER when vkGetPhysicalDeviceImageFormatProperties2
+rejects that.  With SurfaceFlinger on ANGLE this aborts RenderEngine
+("Unable to generate SkSurface") on its CPU-readable render targets,
+e.g. the region sampling buffers.
+
+Venus never creates the AHB image with the requested tiling: the
+deferred create info is always switched to
+VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT with the layout gralloc chose,
+and gralloc allocates CPU-usage buffers linear.  So accept LINEAR as
+well as OPTIMAL in the query.
+
+caoanhhao used AI to code
+---
+ src/virtio/vulkan/vn_physical_device.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index fedab3f..04a9be5 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -2631,11 +2631,15 @@ vn_get_ahb_image_props(struct vn_physical_device *physical_dev,
+                        const VkPhysicalDeviceImageFormatInfo2 *info,
+                        VkImageFormatProperties2 *props)
+ {
+-   /* Only advertise support for optimal tiling since venus is unable to
+-    * detiling if the AHB allocated outside is tiled. Internally venus always
+-    * overrides the tiling to VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT.
++   /* Internally venus always overrides the tiling to
++    * VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT with the layout gralloc chose,
++    * so the requested tiling does not change the image.  Linear is accepted
++    * as well because ANGLE asks for it on every AHB with CPU usage, which
++    * gralloc allocates linear anyway (e.g. SurfaceFlinger's region sampling
++    * buffers); rejecting it makes eglCreateImageKHR fail.
+     */
+-   if (info->tiling != VK_IMAGE_TILING_OPTIMAL)
++   if (info->tiling != VK_IMAGE_TILING_OPTIMAL &&
++       info->tiling != VK_IMAGE_TILING_LINEAR)
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
+    /* No need to support AHB + VK_EXT_separate_stencil_usage. */
+-- 
+2.56.0
+

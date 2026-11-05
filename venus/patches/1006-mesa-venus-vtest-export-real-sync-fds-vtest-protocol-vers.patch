@@ -1,0 +1,201 @@
+From 49556d9bf0ace029fbd681e1fe960706a2981779 Mon Sep 17 00:00:00 2001
+From: caoanhhao <caoanhhao2@gmail.com>
+Date: Thu, 5 Nov 2026 14:20:50 +0700
+Subject: [PATCH] venus/vtest: export real sync fds (vtest protocol version 7)
+
+With a protocol 7 server, export_syncobj sends VCMD_SYNC_EXPORT_FD and
+returns the host sync_file the server passes back over SCM_RIGHTS (a
+NVIDIA fence on the host GPU), or -1 when the sync already signaled.  It
+no longer waits for the GPU on the CPU.
+
+Old servers, and syncs the server cannot export, keep the patch 0001
+behavior: wait for the sync on the CPU and return -1.
+
+Exported fds are host GPU fences, so vn_GetSemaphoreFdKHR no longer
+waits for them on the CPU either (new vn_renderer_info::has_host_sync_fd,
+checked in vn_wsi_sync_wait).
+
+caoanhhao used AI to code
+---
+ src/virtio/vtest/vtest_protocol.h     | 30 +++++++++++++-
+ src/virtio/vulkan/vn_renderer.h       |  2 +
+ src/virtio/vulkan/vn_renderer_vtest.c | 60 +++++++++++++++++++++++++--
+ src/virtio/vulkan/vn_wsi.c            |  3 +-
+ 4 files changed, 89 insertions(+), 6 deletions(-)
+
+diff --git a/src/virtio/vtest/vtest_protocol.h b/src/virtio/vtest/vtest_protocol.h
+index d6728e8..b9bc4ed 100644
+--- a/src/virtio/vtest/vtest_protocol.h
++++ b/src/virtio/vtest/vtest_protocol.h
+@@ -27,7 +27,7 @@
+ 
+ #define VTEST_DEFAULT_SOCKET_NAME "/tmp/.virgl_test"
+ 
+-#define VTEST_PROTOCOL_VERSION 5
++#define VTEST_PROTOCOL_VERSION 7
+ 
+ /* 32-bit length field */
+ /* 32-bit cmd field */
+@@ -97,6 +97,12 @@
+ /* since protocol version 5 */
+ #define VCMD_RESOURCE_IMPORT_BLOB 39
+ 
++/* since protocol version 6 (not used by venus) */
++#define VCMD_ALLOC_DMABUF_IMAGE 40
++
++/* since protocol version 7 */
++#define VCMD_SYNC_EXPORT_FD 41
++
+ #define VCMD_RES_CREATE_SIZE 10
+ #define VCMD_RES_CREATE_RES_HANDLE 0 /* must be 0 since protocol version 3 */
+ #define VCMD_RES_CREATE_TARGET 1
+@@ -364,4 +370,26 @@ enum vcmd_blob_fd_type {
+ /* req fd (SCM_RIGHTS, sent after the command data) */
+ /* rsp res_id (0 on failure) */
+ 
++/* Export a sync_file that signals once the GPU work that will signal
++ * (sync id, value) has completed.  It may signal later than strictly needed
++ * (it covers all work submitted to the ring so far) but never earlier.  On
++ * VCMD_SYNC_EXPORT_FD_FD or VCMD_SYNC_EXPORT_FD_SIGNALED, the server detaches
++ * the sync from pending submits: the client is expected to reset it.
++ */
++#define VCMD_SYNC_EXPORT_FD_SIZE 3
++#define VCMD_SYNC_EXPORT_FD_ID 0
++#define VCMD_SYNC_EXPORT_FD_VALUE_LO 1
++#define VCMD_SYNC_EXPORT_FD_VALUE_HI 2
++
++enum vcmd_sync_export_fd_status {
++   /* the sync already reached value: no fd, use -1 */
++   VCMD_SYNC_EXPORT_FD_SIGNALED = 0,
++   /* a sync_file fd follows (SCM_RIGHTS) */
++   VCMD_SYNC_EXPORT_FD_FD = 1,
++   /* the server cannot export: wait for the sync on the CPU */
++   VCMD_SYNC_EXPORT_FD_UNAVAILABLE = 2,
++};
++#define VCMD_SYNC_EXPORT_FD_RESP_SIZE 1
++#define VCMD_SYNC_EXPORT_FD_RESP_STATUS 0
++
+ #endif /* VTEST_PROTOCOL */
+diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+index c89f268..93e74a2 100644
+--- a/src/virtio/vulkan/vn_renderer.h
++++ b/src/virtio/vulkan/vn_renderer.h
+@@ -68,6 +68,8 @@ struct vn_renderer_info {
+    bool has_external_sync;
+    bool has_timeline_sync;
+    bool has_implicit_fencing;
++   /* exported sync files are fences of the host GPU */
++   bool has_host_sync_fd;
+    bool has_guest_vram;
+ 
+    uint32_t max_timeline_count;
+diff --git a/src/virtio/vulkan/vn_renderer_vtest.c b/src/virtio/vulkan/vn_renderer_vtest.c
+index dccea65..1d7e663 100644
+--- a/src/virtio/vulkan/vn_renderer_vtest.c
++++ b/src/virtio/vulkan/vn_renderer_vtest.c
+@@ -30,6 +30,8 @@
+ 
+ /* VCMD_RESOURCE_IMPORT_BLOB */
+ #define VTEST_DMA_BUF_IMPORT_PROTOCOL_VERSION 5
++/* VCMD_SYNC_EXPORT_FD */
++#define VTEST_SYNC_EXPORT_FD_PROTOCOL_VERSION 7
+ 
+ struct vtest;
+ 
+@@ -499,6 +501,36 @@ vtest_vcmd_sync_read(struct vtest *vtest, uint32_t sync_id)
+    return val;
+ }
+ 
++static int
++vtest_vcmd_sync_export_fd(struct vtest *vtest,
++                          uint32_t sync_id,
++                          uint64_t val,
++                          uint32_t *out_status)
++{
++   uint32_t vtest_hdr[VTEST_HDR_SIZE];
++   uint32_t vcmd_sync_export_fd[VCMD_SYNC_EXPORT_FD_SIZE];
++
++   vtest_hdr[VTEST_CMD_LEN] = VCMD_SYNC_EXPORT_FD_SIZE;
++   vtest_hdr[VTEST_CMD_ID] = VCMD_SYNC_EXPORT_FD;
++
++   vcmd_sync_export_fd[VCMD_SYNC_EXPORT_FD_ID] = sync_id;
++   vcmd_sync_export_fd[VCMD_SYNC_EXPORT_FD_VALUE_LO] = (uint32_t)val;
++   vcmd_sync_export_fd[VCMD_SYNC_EXPORT_FD_VALUE_HI] = (uint32_t)(val >> 32);
++
++   vtest_write(vtest, vtest_hdr, sizeof(vtest_hdr));
++   vtest_write(vtest, vcmd_sync_export_fd, sizeof(vcmd_sync_export_fd));
++
++   vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
++   assert(vtest_hdr[VTEST_CMD_LEN] == VCMD_SYNC_EXPORT_FD_RESP_SIZE);
++   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_SYNC_EXPORT_FD);
++
++   uint32_t resp[VCMD_SYNC_EXPORT_FD_RESP_SIZE];
++   vtest_read(vtest, resp, sizeof(resp));
++   *out_status = resp[VCMD_SYNC_EXPORT_FD_RESP_STATUS];
++
++   return *out_status == VCMD_SYNC_EXPORT_FD_FD ? vtest_receive_fd(vtest) : -1;
++}
++
+ static void
+ vtest_vcmd_sync_write(struct vtest *vtest, uint32_t sync_id, uint64_t val)
+ {
+@@ -987,11 +1019,26 @@ vtest_sync_export_syncobj(struct vn_renderer *renderer,
+                           struct vn_renderer_sync *sync,
+                           bool sync_file)
+ {
+-   /* vtest has no sync_file side channel.  Wait for the sync to be signaled
+-    * (exportable syncs are signaled with value 1 on submit) and hand out -1,
+-    * which is a valid sync file referring to an already signaled object.
+-    */
++   struct vtest *vtest = (struct vtest *)renderer;
++   /* exportable syncs are signaled with value 1 on submit */
+    const uint64_t val = 1;
++
++   if (vtest->protocol_version >= VTEST_SYNC_EXPORT_FD_PROTOCOL_VERSION) {
++      uint32_t status;
++
++      mtx_lock(&vtest->sock_mutex);
++      const int fd =
++         vtest_vcmd_sync_export_fd(vtest, sync->sync_id, val, &status);
++      mtx_unlock(&vtest->sock_mutex);
++
++      if (status != VCMD_SYNC_EXPORT_FD_UNAVAILABLE)
++         return fd;
++   }
++
++   /* Old server, or it cannot export this sync.  Wait for the sync to be
++    * signaled and hand out -1, which is a valid sync file referring to an
++    * already signaled object.
++    */
+    const struct vn_renderer_wait wait = {
+       .timeout = UINT64_MAX,
+       .syncs = &sync,
+@@ -1027,6 +1074,11 @@ vtest_init_renderer_info(struct vtest *vtest)
+    info->has_dma_buf_import =
+       vtest->protocol_version >= VTEST_DMA_BUF_IMPORT_PROTOCOL_VERSION;
+    info->has_external_sync = true;
++   /* exported sync files are host fences that the host compositor can wait
++    * on, so there is no need to wait for them on export
++    */
++   info->has_host_sync_fd =
++      vtest->protocol_version >= VTEST_SYNC_EXPORT_FD_PROTOCOL_VERSION;
+    info->has_timeline_sync = !VN_PERF(NO_TIMELINE_SYNC);
+    info->has_implicit_fencing = false;
+ 
+diff --git a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
+index e73ab48..c4cff74 100644
+--- a/src/virtio/vulkan/vn_wsi.c
++++ b/src/virtio/vulkan/vn_wsi.c
+@@ -448,7 +448,8 @@ vn_wsi_fence_wait(VkQueue queue_handle)
+ void
+ vn_wsi_sync_wait(struct vn_device *dev, int fd)
+ {
+-   if (dev->renderer->info.has_implicit_fencing)
++   if (dev->renderer->info.has_implicit_fencing ||
++       dev->renderer->info.has_host_sync_fd)
+       return;
+ 
+    const pid_t tid = vn_gettid();
+-- 
+2.56.0
+

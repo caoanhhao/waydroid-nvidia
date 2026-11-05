@@ -1,0 +1,89 @@
+From 6cacc6bf173c6aa51aca5f5532f3b29a983efea7 Mon Sep 17 00:00:00 2001
+From: caoanhhao <caoanhhao2@gmail.com>
+Date: Thu, 5 Nov 2026 12:59:54 +0700
+Subject: [PATCH] venus/android: advertise device-local types for foreign AHB
+ memory
+
+A dma-buf from another device, such as a linear gralloc buffer in
+system memory allocated by the iGPU, can be importable only into
+renderer memory types without DEVICE_LOCAL (on NVIDIA: memoryTypeBits
+0x9, a flagless type and a host-cached one).  ANGLE asks for a
+DEVICE_LOCAL type when it imports an AHardwareBuffer and has no other
+fallback, so eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID) fails with
+EGL_BAD_PARAMETER and SurfaceFlinger's RenderEngine aborts ("Unable to
+generate SkSurface"); the Waydroid hwcomposer crashes in ANGLE's error
+path.
+
+Override vkGetAndroidHardwareBufferPropertiesANDROID to also report
+the pure device-local types in that case.  This is safe because
+vn_android_device_import_ahb already replaces a memory type index the
+dma-buf cannot be imported into with a compatible one.  Host-visible
+types are not added, so mappability stays truthful.
+
+caoanhhao used AI to code
+---
+ src/virtio/vulkan/vn_android.c | 39 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/src/virtio/vulkan/vn_android.c b/src/virtio/vulkan/vn_android.c
+index eaa82bc..31eb52f 100644
+--- a/src/virtio/vulkan/vn_android.c
++++ b/src/virtio/vulkan/vn_android.c
+@@ -15,11 +15,13 @@
+ 
+ #include "util/os_file.h"
+ #include "util/u_gralloc/u_gralloc.h"
++#include "vk_common_entrypoints.h"
+ 
+ #include "vn_buffer.h"
+ #include "vn_device.h"
+ #include "vn_device_memory.h"
+ #include "vn_image.h"
++#include "vn_physical_device.h"
+ 
+ #define VN_MAX_PLANES 4
+ 
+@@ -245,3 +247,40 @@ vn_android_device_import_ahb(struct vn_device *dev,
+ 
+    return VK_SUCCESS;
+ }
++
++VKAPI_ATTR VkResult VKAPI_CALL
++vn_GetAndroidHardwareBufferPropertiesANDROID(
++   VkDevice device,
++   const struct AHardwareBuffer *buffer,
++   VkAndroidHardwareBufferPropertiesANDROID *pProperties)
++{
++   struct vn_device *dev = vn_device_from_handle(device);
++   VkResult result = vk_common_GetAndroidHardwareBufferPropertiesANDROID(
++      device, buffer, pProperties);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* A dma-buf from another device (e.g. a linear gralloc buffer in system
++    * memory) can be importable only into memory types without
++    * DEVICE_LOCAL on the renderer.  ANGLE requires a DEVICE_LOCAL type for
++    * AHB imports and fails eglCreateImageKHR otherwise.  Also advertise the
++    * pure device-local types: vn_android_device_import_ahb already replaces
++    * a memory type index that the dma-buf cannot be imported into with one
++    * that it can.  Host-visible types are left out so that the advertised
++    * mappability stays truthful.
++    */
++   const VkPhysicalDeviceMemoryProperties *mem_props =
++      &dev->physical_device->memory_properties;
++   uint32_t device_local_bits = 0;
++   for (uint32_t i = 0; i < mem_props->memoryTypeCount; i++) {
++      const VkMemoryPropertyFlags flags = mem_props->memoryTypes[i].propertyFlags;
++      if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
++          !(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
++         device_local_bits |= 1u << i;
++   }
++   if (pProperties->memoryTypeBits &&
++       !(pProperties->memoryTypeBits & device_local_bits))
++      pProperties->memoryTypeBits |= device_local_bits;
++
++   return VK_SUCCESS;
++}
+-- 
+2.56.0
+

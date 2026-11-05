@@ -1,0 +1,23 @@
+[Unit]
+Description=Venus vtest server for Waydroid (Vulkan on the host GPU)
+# keep retrying (e.g. GPU not ready yet) instead of giving up after 5 fast failures
+StartLimitIntervalSec=0
+
+[Service]
+# Android apps connect with other uids, so the socket must be world-writable.
+UMask=0000
+Environment=RENDER_SERVER_EXEC_PATH=%h/.local/lib/waydroid-venus/bin/virgl_render_server
+# the binaries' RUNPATH ($ORIGIN/../src) points into the build tree; the system
+# libvirglrenderer (no vtest v6) must not be picked up instead
+Environment=LD_LIBRARY_PATH=%h/.local/lib/waydroid-venus/lib
+ExecStartPre=/usr/bin/mkdir -p %h/.local/share/waydroid/data/vtest
+ExecStartPre=/usr/bin/chmod 0777 %h/.local/share/waydroid/data/vtest
+ExecStartPre=/usr/bin/rm -f %h/.local/share/waydroid/data/vtest/vtest.sock
+ExecStart=%h/.local/lib/waydroid-venus/bin/virgl_test_server --venus --no-virgl --multi-clients \
+    --rendernode /dev/dri/renderD129 \
+    --socket-path %h/.local/share/waydroid/data/vtest/vtest.sock
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

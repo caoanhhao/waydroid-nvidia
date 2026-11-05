@@ -1,0 +1,192 @@
+From 2d01ffb407b560b2ea6fce0e715e730ff1f51aeb Mon Sep 17 00:00:00 2001
+From: caoanhhao <caoanhhao2@gmail.com>
+Date: Thu, 5 Nov 2026 11:44:27 +0700
+Subject: [PATCH] vtest: add VCMD_RESOURCE_IMPORT_BLOB (protocol version 5)
+
+Let a vtest client import a dma-buf it allocated (e.g. a gralloc/gbm
+window buffer) as a blob resource.  The client sends the blob type
+(HOST3D), fd type (DMABUF) and size, then passes the fd with
+SCM_RIGHTS.  The server imports it with
+virgl_renderer_resource_import_blob, attaches it to the context (the
+proxy forwards the dma-buf to the render server) and replies with the
+new res_id, or 0 on failure so the client can report
+VK_ERROR_INVALID_EXTERNAL_HANDLE instead of being disconnected.
+
+The size is taken from lseek(fd, 0, SEEK_END) when available; the
+client value is only a hint and must not exceed it.
+
+caoanhhao used AI to code
+---
+ vtest/vtest.h          |  3 ++
+ vtest/vtest_protocol.h | 17 ++++++++-
+ vtest/vtest_renderer.c | 85 ++++++++++++++++++++++++++++++++++++++++++
+ vtest/vtest_server.c   |  3 ++
+ 4 files changed, 107 insertions(+), 1 deletion(-)
+
+diff --git a/vtest/vtest.h b/vtest/vtest.h
+index b2708a20..dfa03595 100644
+--- a/vtest/vtest.h
++++ b/vtest/vtest.h
+@@ -113,6 +113,9 @@ int vtest_drm_sync_query(uint32_t length_dw);
+ int vtest_drm_sync_transfer(uint32_t length_dw);
+ int vtest_resource_export_fd(uint32_t length_dw);
+ 
++/* since protocol version 5 */
++int vtest_resource_import_blob(uint32_t length_dw);
++
+ void vtest_set_max_length(uint32_t length);
+ 
+ #endif
+diff --git a/vtest/vtest_protocol.h b/vtest/vtest_protocol.h
+index 1bd515c5..d6728e84 100644
+--- a/vtest/vtest_protocol.h
++++ b/vtest/vtest_protocol.h
+@@ -27,7 +27,7 @@
+ 
+ #define VTEST_DEFAULT_SOCKET_NAME "/tmp/.virgl_test"
+ 
+-#define VTEST_PROTOCOL_VERSION 4
++#define VTEST_PROTOCOL_VERSION 5
+ 
+ /* 32-bit length field */
+ /* 32-bit cmd field */
+@@ -94,6 +94,9 @@
+ #define VCMD_DRM_SYNC_TRANSFER 37
+ #define VCMD_RESOURCE_EXPORT_FD 38
+ 
++/* since protocol version 5 */
++#define VCMD_RESOURCE_IMPORT_BLOB 39
++
+ #define VCMD_RES_CREATE_SIZE 10
+ #define VCMD_RES_CREATE_RES_HANDLE 0 /* must be 0 since protocol version 3 */
+ #define VCMD_RES_CREATE_TARGET 1
+@@ -349,4 +352,16 @@ struct vcmd_submit_cmd2_batch {
+ #define VCMD_RESOURCE_EXPORT_FD_RES_HANDLE 0
+ /* rsp fd */
+ 
++enum vcmd_blob_fd_type {
++   VCMD_BLOB_FD_TYPE_DMABUF = 1,
++};
++
++#define VCMD_RESOURCE_IMPORT_BLOB_SIZE 4
++#define VCMD_RESOURCE_IMPORT_BLOB_TYPE 0    /* enum vcmd_blob_type, must be HOST3D */
++#define VCMD_RESOURCE_IMPORT_BLOB_FD_TYPE 1 /* enum vcmd_blob_fd_type */
++#define VCMD_RESOURCE_IMPORT_BLOB_SIZE_LO 2 /* 0 means lseek(fd, 0, SEEK_END) */
++#define VCMD_RESOURCE_IMPORT_BLOB_SIZE_HI 3
++/* req fd (SCM_RIGHTS, sent after the command data) */
++/* rsp res_id (0 on failure) */
++
+ #endif /* VTEST_PROTOCOL */
+diff --git a/vtest/vtest_renderer.c b/vtest/vtest_renderer.c
+index ba4feb1a..e5490a45 100644
+--- a/vtest/vtest_renderer.c
++++ b/vtest/vtest_renderer.c
+@@ -3053,6 +3053,91 @@ out:
+    return ret;
+ }
+ 
++static uint32_t
++vtest_resource_import_blob_internal(struct vtest_context *ctx,
++                                    const uint32_t *req, int fd)
++{
++   struct virgl_renderer_resource_import_blob_args args;
++   struct vtest_resource *res;
++   uint64_t size;
++   int ret;
++
++   if (req[VCMD_RESOURCE_IMPORT_BLOB_TYPE] != VCMD_BLOB_TYPE_HOST3D ||
++       req[VCMD_RESOURCE_IMPORT_BLOB_FD_TYPE] != VCMD_BLOB_FD_TYPE_DMABUF) {
++      close(fd);
++      return 0;
++   }
++
++   /* the dma-buf size is authoritative; the client size is only a hint */
++   size = req[VCMD_RESOURCE_IMPORT_BLOB_SIZE_LO];
++   size |= (uint64_t)req[VCMD_RESOURCE_IMPORT_BLOB_SIZE_HI] << 32;
++   off_t fd_size = lseek(fd, 0, SEEK_END);
++   if (fd_size > 0) {
++      if (size > (uint64_t)fd_size) {
++         report_failure("import blob size larger than dma-buf", -EINVAL);
++         close(fd);
++         return 0;
++      }
++      size = fd_size;
++   }
++   if (!size) {
++      close(fd);
++      return 0;
++   }
++
++   res = vtest_new_resource(0);
++   if (!res) {
++      close(fd);
++      return 0;
++   }
++
++   memset(&args, 0, sizeof(args));
++   args.res_handle = res->res_id;
++   args.blob_mem = VIRGL_RENDERER_BLOB_MEM_HOST3D;
++   args.fd_type = VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF;
++   args.fd = fd;
++   args.size = size;
++
++   /* takes ownership of fd on success and on -ENOMEM */
++   ret = virgl_renderer_resource_import_blob(&args);
++   if (ret) {
++      if (ret != -ENOMEM)
++         close(fd);
++      list_add(&res->head, &renderer.free_resources);
++      report_failed_call("virgl_renderer_resource_import_blob", ret);
++      return 0;
++   }
++
++   virgl_renderer_ctx_attach_resource(ctx->ctx_id, res->res_id);
++   util_hash_table_set(ctx->resource_table, intptr_to_pointer(res->res_id), res);
++
++   return res->res_id;
++}
++
++int vtest_resource_import_blob(UNUSED uint32_t length_dw)
++{
++   struct vtest_context *ctx = vtest_get_current_context();
++   uint32_t req[VCMD_RESOURCE_IMPORT_BLOB_SIZE];
++   uint32_t resp_buf[VTEST_HDR_SIZE + 1];
++   int ret, fd;
++
++   ret = ctx->input->read(ctx->input, req, sizeof(req));
++   if (ret != sizeof(req))
++      return -1;
++
++   fd = vtest_receive_fd(ctx->input->data.fd);
++   if (fd < 0)
++      return fd;
++
++   resp_buf[VTEST_CMD_LEN] = 1;
++   resp_buf[VTEST_CMD_ID] = VCMD_RESOURCE_IMPORT_BLOB;
++   resp_buf[VTEST_CMD_DATA_START] =
++      vtest_resource_import_blob_internal(ctx, req, fd);
++
++   ret = vtest_block_write(ctx->out_fd, resp_buf, sizeof(resp_buf));
++   return ret < 0 ? ret : 0;
++}
++
+ void vtest_set_max_length(uint32_t length)
+ {
+    renderer.max_length = length;
+diff --git a/vtest/vtest_server.c b/vtest/vtest_server.c
+index 64a29e1a..8db65fbc 100644
+--- a/vtest/vtest_server.c
++++ b/vtest/vtest_server.c
+@@ -730,6 +730,9 @@ static const struct vtest_command {
+    HANDLER(DRM_SYNC_TRANSFER,           drm_sync_transfer,         true   ),
+ #endif /* ENABLE_DRM */
+    HANDLER(RESOURCE_EXPORT_FD,          resource_export_fd,        true   ),
++
++   /* since protocol version 5 */
++   HANDLER(RESOURCE_IMPORT_BLOB,        resource_import_blob,      true   ),
+ };
+ 
+ static int vtest_client_dispatch_commands(struct vtest_client *client)
+-- 
+2.56.0
+

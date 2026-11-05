@@ -1,0 +1,50 @@
+diff --git a/src/virtio/vulkan/vn_renderer_vtest.c b/src/virtio/vulkan/vn_renderer_vtest.c
+index fc59d32..6b8d3e6 100644
+--- a/src/virtio/vulkan/vn_renderer_vtest.c
++++ b/src/virtio/vulkan/vn_renderer_vtest.c
+@@ -863,6 +863,27 @@ vtest_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
+    return result;
+ }
+ 
++static int
++vtest_sync_export_syncobj(struct vn_renderer *renderer,
++                          struct vn_renderer_sync *sync,
++                          bool sync_file)
++{
++   /* vtest has no sync_file side channel.  Wait for the sync to be signaled
++    * (exportable syncs are signaled with value 1 on submit) and hand out -1,
++    * which is a valid sync file referring to an already signaled object.
++    */
++   const uint64_t val = 1;
++   const struct vn_renderer_wait wait = {
++      .timeout = UINT64_MAX,
++      .syncs = &sync,
++      .sync_values = &val,
++      .sync_count = 1,
++   };
++   vtest_wait(renderer, &wait);
++
++   return -1;
++}
++
+ static VkResult
+ vtest_submit(struct vn_renderer *renderer,
+              const struct vn_renderer_submit_batch *batch)
+@@ -885,7 +906,7 @@ vtest_init_renderer_info(struct vtest *vtest)
+    info->pci.device_id = VTEST_PCI_DEVICE_ID;
+ 
+    info->has_dma_buf_import = false;
+-   info->has_external_sync = false;
++   info->has_external_sync = true;
+    info->has_timeline_sync = !VN_PERF(NO_TIMELINE_SYNC);
+    info->has_implicit_fencing = false;
+ 
+@@ -1042,7 +1063,7 @@ vtest_init(struct vtest *vtest)
+    vtest->base.sync_ops.create = vtest_sync_create;
+    vtest->base.sync_ops.create_from_syncobj = NULL;
+    vtest->base.sync_ops.destroy = vtest_sync_destroy;
+-   vtest->base.sync_ops.export_syncobj = NULL;
++   vtest->base.sync_ops.export_syncobj = vtest_sync_export_syncobj;
+    vtest->base.sync_ops.reset = vtest_sync_reset;
+    vtest->base.sync_ops.read = vtest_sync_read;
+    vtest->base.sync_ops.write = vtest_sync_write;

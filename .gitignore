@@ -1,0 +1,8 @@
+# sources and build trees (patches in venus/patches reproduce them)
+/src/
+# built release payload (release/build.sh regenerates it)
+/release/dist/
+# test binaries and logs
+/venus/tests/build/
+# logs and measurement output
+*.txt

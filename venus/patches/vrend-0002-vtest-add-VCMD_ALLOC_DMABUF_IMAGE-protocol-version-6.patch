@@ -1,0 +1,797 @@
+From 099649656458ca86803e1c5d544851ad23c753ce Mon Sep 17 00:00:00 2001
+From: caoanhhao <caoanhhao2@gmail.com>
+Date: Thu, 5 Nov 2026 12:07:51 +0700
+Subject: [PATCH] vtest: add VCMD_ALLOC_DMABUF_IMAGE (protocol version 6)
+
+Let a vtest client (e.g. an Android gralloc) allocate window buffers on
+the host GPU and get them back as dma-bufs with the host's real DRM
+format modifier, so the buffers can be rendered by Venus and scanned
+out / composited by a host compositor without copies.
+
+The request carries width, height, a single-plane DRM fourcc, usage
+flags (render / texture / scanout) and an optional list of allowed
+modifiers (e.g. the compositor's).  The server intersects that list
+with the device's exportable modifiers that have the needed tiling
+features, creates a VkImage with VkImageDrmFormatModifierListCreateInfoEXT
+and dedicated, exportable device-local memory, and replies with the
+chosen modifier, row pitch, offset and size, followed by the dma-buf
+fd over SCM_RIGHTS.  Errors are returned as a positive errno and keep
+the connection.
+
+The allocator lives in the vtest server process (vtest_vk_alloc.c,
+libvulkan is dlopen'ed) with its own VkDevice on the --rendernode GPU,
+matched through VK_EXT_physical_device_drm.  It is stateless: the
+image and memory are released right after export and the dma-buf keeps
+the allocation alive.  The command does not need a venus context.
+
+caoanhhao used AI to code
+---
+ vtest/meson.build      |   5 +-
+ vtest/vtest.h          |   3 +
+ vtest/vtest_protocol.h |  36 ++-
+ vtest/vtest_renderer.c |  59 +++++
+ vtest/vtest_server.c   |   3 +
+ vtest/vtest_vk_alloc.c | 513 +++++++++++++++++++++++++++++++++++++++++
+ vtest/vtest_vk_alloc.h |  43 ++++
+ 7 files changed, 660 insertions(+), 2 deletions(-)
+ create mode 100644 vtest/vtest_vk_alloc.c
+ create mode 100644 vtest/vtest_vk_alloc.h
+
+diff --git a/vtest/meson.build b/vtest/meson.build
+index c2bd2782..3011d015 100644
+--- a/vtest/meson.build
++++ b/vtest/meson.build
+@@ -30,6 +30,8 @@ vtest_sources = [
+    'vtest_server.c',
+    'vtest_renderer.c',
+    'vtest_protocol.h',
++   'vtest_vk_alloc.c',
++   'vtest_vk_alloc.h',
+    'vtest.h'
+ ]
+ 
+@@ -48,7 +50,8 @@ endif
+ libvtest = static_library(
+    'vtest',
+    vtest_sources,
+-   dependencies : vtest_depends,
++   include_directories : include_directories('../src/venus'),
++   dependencies : vtest_depends + [dl_dep],
+ )
+ 
+ libvtest_dep = declare_dependency(
+diff --git a/vtest/vtest.h b/vtest/vtest.h
+index dfa03595..f6bf4f47 100644
+--- a/vtest/vtest.h
++++ b/vtest/vtest.h
+@@ -116,6 +116,9 @@ int vtest_resource_export_fd(uint32_t length_dw);
+ /* since protocol version 5 */
+ int vtest_resource_import_blob(uint32_t length_dw);
+ 
++/* since protocol version 6 */
++int vtest_alloc_dmabuf_image(uint32_t length_dw);
++
+ void vtest_set_max_length(uint32_t length);
+ 
+ #endif
+diff --git a/vtest/vtest_protocol.h b/vtest/vtest_protocol.h
+index d6728e84..5fcf521a 100644
+--- a/vtest/vtest_protocol.h
++++ b/vtest/vtest_protocol.h
+@@ -27,7 +27,7 @@
+ 
+ #define VTEST_DEFAULT_SOCKET_NAME "/tmp/.virgl_test"
+ 
+-#define VTEST_PROTOCOL_VERSION 5
++#define VTEST_PROTOCOL_VERSION 6
+ 
+ /* 32-bit length field */
+ /* 32-bit cmd field */
+@@ -97,6 +97,9 @@
+ /* since protocol version 5 */
+ #define VCMD_RESOURCE_IMPORT_BLOB 39
+ 
++/* since protocol version 6 */
++#define VCMD_ALLOC_DMABUF_IMAGE 40
++
+ #define VCMD_RES_CREATE_SIZE 10
+ #define VCMD_RES_CREATE_RES_HANDLE 0 /* must be 0 since protocol version 3 */
+ #define VCMD_RES_CREATE_TARGET 1
+@@ -364,4 +367,35 @@ enum vcmd_blob_fd_type {
+ /* req fd (SCM_RIGHTS, sent after the command data) */
+ /* rsp res_id (0 on failure) */
+ 
++/* VCMD_ALLOC_DMABUF_IMAGE: allocate a window buffer on the host GPU and
++ * export it as a dma-buf.  Stateless: no resource is created, the client owns
++ * the returned fd and can import it later with VCMD_RESOURCE_IMPORT_BLOB.
++ * Does not need (or create) a venus context.
++ */
++enum vcmd_alloc_dmabuf_image_flag {
++   VCMD_ALLOC_DMABUF_IMAGE_FLAG_RENDER = 1 << 0,  /* color attachment */
++   VCMD_ALLOC_DMABUF_IMAGE_FLAG_TEXTURE = 1 << 1, /* sampled */
++   VCMD_ALLOC_DMABUF_IMAGE_FLAG_SCANOUT = 1 << 2, /* given to the compositor */
++};
++
++#define VCMD_ALLOC_DMABUF_IMAGE_MAX_MODIFIERS 64
++#define VCMD_ALLOC_DMABUF_IMAGE_SIZE(count) (5 + 2 * (count))
++#define VCMD_ALLOC_DMABUF_IMAGE_WIDTH 0
++#define VCMD_ALLOC_DMABUF_IMAGE_HEIGHT 1
++#define VCMD_ALLOC_DMABUF_IMAGE_FORMAT 2 /* DRM fourcc, single plane */
++#define VCMD_ALLOC_DMABUF_IMAGE_FLAGS 3
++#define VCMD_ALLOC_DMABUF_IMAGE_MODIFIER_COUNT 4 /* 0 = any */
++#define VCMD_ALLOC_DMABUF_IMAGE_MODIFIER_LO(n) (5 + 2 * (n) + 0)
++#define VCMD_ALLOC_DMABUF_IMAGE_MODIFIER_HI(n) (5 + 2 * (n) + 1)
++
++#define VCMD_ALLOC_DMABUF_IMAGE_RESP_SIZE 7
++#define VCMD_ALLOC_DMABUF_IMAGE_RESP_ERROR 0 /* 0 or a positive errno */
++#define VCMD_ALLOC_DMABUF_IMAGE_RESP_MODIFIER_LO 1
++#define VCMD_ALLOC_DMABUF_IMAGE_RESP_MODIFIER_HI 2
++#define VCMD_ALLOC_DMABUF_IMAGE_RESP_STRIDE 3
++#define VCMD_ALLOC_DMABUF_IMAGE_RESP_OFFSET 4
++#define VCMD_ALLOC_DMABUF_IMAGE_RESP_SIZE_LO 5
++#define VCMD_ALLOC_DMABUF_IMAGE_RESP_SIZE_HI 6
++/* rsp fd (SCM_RIGHTS) only when ERROR == 0 */
++
+ #endif /* VTEST_PROTOCOL */
+diff --git a/vtest/vtest_renderer.c b/vtest/vtest_renderer.c
+index e5490a45..f4cb0521 100644
+--- a/vtest/vtest_renderer.c
++++ b/vtest/vtest_renderer.c
+@@ -54,6 +54,7 @@
+ #include "vtest.h"
+ #include "vtest_shm.h"
+ #include "vtest_protocol.h"
++#include "vtest_vk_alloc.h"
+ #include "threadpool.h"
+ 
+ #include "util.h"
+@@ -3138,6 +3139,64 @@ int vtest_resource_import_blob(UNUSED uint32_t length_dw)
+    return ret < 0 ? ret : 0;
+ }
+ 
++int vtest_alloc_dmabuf_image(uint32_t length_dw)
++{
++   struct vtest_context *ctx = vtest_get_current_context();
++   uint32_t req_buf[VCMD_ALLOC_DMABUF_IMAGE_SIZE(VCMD_ALLOC_DMABUF_IMAGE_MAX_MODIFIERS)];
++   uint64_t modifiers[VCMD_ALLOC_DMABUF_IMAGE_MAX_MODIFIERS];
++   uint32_t resp_buf[VTEST_HDR_SIZE + VCMD_ALLOC_DMABUF_IMAGE_RESP_SIZE];
++   uint32_t *resp = &resp_buf[VTEST_CMD_DATA_START];
++   struct vtest_vk_alloc_result result = { .fd = -1 };
++   int ret;
++
++   if (length_dw < VCMD_ALLOC_DMABUF_IMAGE_SIZE(0) ||
++       length_dw > ARRAY_SIZE(req_buf))
++      return -EINVAL;
++
++   ret = ctx->input->read(ctx->input, req_buf, length_dw * sizeof(uint32_t));
++   if (ret != (int)(length_dw * sizeof(uint32_t)))
++      return -1;
++
++   const uint32_t count = req_buf[VCMD_ALLOC_DMABUF_IMAGE_MODIFIER_COUNT];
++   if (length_dw != VCMD_ALLOC_DMABUF_IMAGE_SIZE(count))
++      return -EINVAL;
++   for (uint32_t i = 0; i < count; i++) {
++      modifiers[i] = req_buf[VCMD_ALLOC_DMABUF_IMAGE_MODIFIER_LO(i)] |
++                     (uint64_t)req_buf[VCMD_ALLOC_DMABUF_IMAGE_MODIFIER_HI(i)] << 32;
++   }
++
++   const struct vtest_vk_alloc_request req = {
++      .width = req_buf[VCMD_ALLOC_DMABUF_IMAGE_WIDTH],
++      .height = req_buf[VCMD_ALLOC_DMABUF_IMAGE_HEIGHT],
++      .drm_format = req_buf[VCMD_ALLOC_DMABUF_IMAGE_FORMAT],
++      .flags = req_buf[VCMD_ALLOC_DMABUF_IMAGE_FLAGS],
++      .modifier_count = count,
++      .modifiers = modifiers,
++   };
++   ret = vtest_vk_alloc_dmabuf_image(renderer.rendernode_name, &req, &result);
++
++   memset(resp_buf, 0, sizeof(resp_buf));
++   resp_buf[VTEST_CMD_LEN] = VCMD_ALLOC_DMABUF_IMAGE_RESP_SIZE;
++   resp_buf[VTEST_CMD_ID] = VCMD_ALLOC_DMABUF_IMAGE;
++   resp[VCMD_ALLOC_DMABUF_IMAGE_RESP_ERROR] = ret < 0 ? (uint32_t)-ret : 0;
++   if (!ret) {
++      resp[VCMD_ALLOC_DMABUF_IMAGE_RESP_MODIFIER_LO] = (uint32_t)result.modifier;
++      resp[VCMD_ALLOC_DMABUF_IMAGE_RESP_MODIFIER_HI] = (uint32_t)(result.modifier >> 32);
++      resp[VCMD_ALLOC_DMABUF_IMAGE_RESP_STRIDE] = result.stride;
++      resp[VCMD_ALLOC_DMABUF_IMAGE_RESP_OFFSET] = result.offset;
++      resp[VCMD_ALLOC_DMABUF_IMAGE_RESP_SIZE_LO] = (uint32_t)result.size;
++      resp[VCMD_ALLOC_DMABUF_IMAGE_RESP_SIZE_HI] = (uint32_t)(result.size >> 32);
++   }
++
++   ret = vtest_block_write(ctx->out_fd, resp_buf, sizeof(resp_buf));
++   if (ret >= 0 && result.fd >= 0)
++      ret = vtest_send_fd(ctx->out_fd, result.fd);
++   if (result.fd >= 0)
++      close(result.fd);
++
++   return ret < 0 ? ret : 0;
++}
++
+ void vtest_set_max_length(uint32_t length)
+ {
+    renderer.max_length = length;
+diff --git a/vtest/vtest_server.c b/vtest/vtest_server.c
+index 8db65fbc..1bee25b1 100644
+--- a/vtest/vtest_server.c
++++ b/vtest/vtest_server.c
+@@ -733,6 +733,9 @@ static const struct vtest_command {
+ 
+    /* since protocol version 5 */
+    HANDLER(RESOURCE_IMPORT_BLOB,        resource_import_blob,      true   ),
++
++   /* since protocol version 6 */
++   HANDLER(ALLOC_DMABUF_IMAGE,          alloc_dmabuf_image,        false  ),
+ };
+ 
+ static int vtest_client_dispatch_commands(struct vtest_client *client)
+diff --git a/vtest/vtest_vk_alloc.c b/vtest/vtest_vk_alloc.c
+new file mode 100644
+index 00000000..c00e120e
+--- /dev/null
++++ b/vtest/vtest_vk_alloc.c
+@@ -0,0 +1,513 @@
++/*
++ * Copyright 2026 waydroid-nvidia contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * Host-side window buffer allocator for VCMD_ALLOC_DMABUF_IMAGE: exportable
++ * VkImages with a DRM format modifier, handed to the client as dma-bufs.
++ * Runs in the vtest server process with its own VkDevice, independent of
++ * any venus context.
++ */
++
++#include "config.h"
++
++#include <dlfcn.h>
++#include <errno.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
++#include <unistd.h>
++
++#define VK_NO_PROTOTYPES
++#include "venus-protocol/vulkan_core.h"
++
++#include <drm_fourcc.h>
++
++#include "vtest_protocol.h"
++#include "vtest_vk_alloc.h"
++
++#define MAX_MODIFIERS 64
++
++#define VK_FUNCS(X)                                \
++   X(DestroyInstance)                              \
++   X(EnumeratePhysicalDevices)                     \
++   X(EnumerateDeviceExtensionProperties)           \
++   X(GetPhysicalDeviceProperties2)                 \
++   X(GetPhysicalDeviceFormatProperties2)           \
++   X(GetPhysicalDeviceImageFormatProperties2)      \
++   X(GetPhysicalDeviceMemoryProperties)            \
++   X(CreateDevice)                                 \
++   X(DestroyDevice)                                \
++   X(CreateImage)                                  \
++   X(DestroyImage)                                 \
++   X(GetImageMemoryRequirements2)                  \
++   X(GetImageSubresourceLayout)                    \
++   X(GetImageDrmFormatModifierPropertiesEXT)       \
++   X(AllocateMemory)                               \
++   X(FreeMemory)                                   \
++   X(BindImageMemory)                              \
++   X(GetMemoryFdKHR)
++
++static struct {
++   bool initialized;
++   bool ok;
++
++   void *lib;
++   PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
++#define DECLARE(name) PFN_vk##name name;
++   VK_FUNCS(DECLARE)
++#undef DECLARE
++
++   VkInstance instance;
++   VkPhysicalDevice pdev;
++   VkDevice dev;
++   VkPhysicalDeviceMemoryProperties mem_props;
++} vk;
++
++static const char *const device_exts[] = {
++   VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
++   VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
++   VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
++};
++
++static void
++log_msg(const char *fmt, const char *arg)
++{
++   fprintf(stderr, "vtest_vk_alloc: ");
++   fprintf(stderr, fmt, arg);
++   fprintf(stderr, "\n");
++}
++
++static bool
++has_device_ext(VkPhysicalDevice pdev, const char *name)
++{
++   uint32_t count = 0;
++   vk.EnumerateDeviceExtensionProperties(pdev, NULL, &count, NULL);
++   VkExtensionProperties *props = calloc(count, sizeof(*props));
++   if (!props)
++      return false;
++   vk.EnumerateDeviceExtensionProperties(pdev, NULL, &count, props);
++
++   bool found = false;
++   for (uint32_t i = 0; i < count && !found; i++)
++      found = !strcmp(props[i].extensionName, name);
++   free(props);
++   return found;
++}
++
++static bool
++pdev_matches_node(VkPhysicalDevice pdev, const struct stat *node)
++{
++   if (!node)
++      return true;
++   if (!has_device_ext(pdev, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME))
++      return false;
++
++   VkPhysicalDeviceDrmPropertiesEXT drm = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
++   };
++   VkPhysicalDeviceProperties2 props = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
++      .pNext = &drm,
++   };
++   vk.GetPhysicalDeviceProperties2(pdev, &props);
++
++   const dev_t rdev = node->st_rdev;
++   return (drm.hasRender && drm.renderMajor == major(rdev) &&
++           drm.renderMinor == minor(rdev)) ||
++          (drm.hasPrimary && drm.primaryMajor == major(rdev) &&
++           drm.primaryMinor == minor(rdev));
++}
++
++static bool
++vk_init(const char *render_node)
++{
++   vk.lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
++   if (!vk.lib) {
++      log_msg("%s", dlerror());
++      return false;
++   }
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wpedantic"
++   /* ISO C forbids conversion of object pointer to function pointer type */
++   vk.GetInstanceProcAddr =
++      (PFN_vkGetInstanceProcAddr)dlsym(vk.lib, "vkGetInstanceProcAddr");
++#pragma GCC diagnostic pop
++   PFN_vkCreateInstance create_instance =
++      vk.GetInstanceProcAddr
++         ? (PFN_vkCreateInstance)vk.GetInstanceProcAddr(NULL, "vkCreateInstance")
++         : NULL;
++   if (!create_instance)
++      return false;
++
++   const VkApplicationInfo app = {
++      .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++      .pApplicationName = "virgl_test_server dma-buf allocator",
++      .apiVersion = VK_API_VERSION_1_2,
++   };
++   const VkInstanceCreateInfo instance_info = {
++      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++      .pApplicationInfo = &app,
++   };
++   if (create_instance(&instance_info, NULL, &vk.instance) != VK_SUCCESS) {
++      log_msg("%s", "vkCreateInstance failed");
++      return false;
++   }
++
++#define LOAD(name)                                                            \
++   vk.name = (PFN_vk##name)vk.GetInstanceProcAddr(vk.instance, "vk" #name);  \
++   if (!vk.name) {                                                            \
++      log_msg("missing vk%s", #name);                                         \
++      return false;                                                           \
++   }
++   VK_FUNCS(LOAD)
++#undef LOAD
++
++   struct stat node_stat;
++   const bool have_node = render_node && !stat(render_node, &node_stat);
++
++   uint32_t count = 0;
++   vk.EnumeratePhysicalDevices(vk.instance, &count, NULL);
++   VkPhysicalDevice *pdevs = calloc(count, sizeof(*pdevs));
++   if (!pdevs)
++      return false;
++   vk.EnumeratePhysicalDevices(vk.instance, &count, pdevs);
++   for (uint32_t i = 0; i < count && !vk.pdev; i++) {
++      bool usable = pdev_matches_node(pdevs[i], have_node ? &node_stat : NULL);
++      for (uint32_t j = 0; usable && j < sizeof(device_exts) / sizeof(*device_exts); j++)
++         usable = has_device_ext(pdevs[i], device_exts[j]);
++      if (usable)
++         vk.pdev = pdevs[i];
++   }
++   free(pdevs);
++   if (!vk.pdev) {
++      log_msg("no Vulkan device with dma-buf modifier export for %s",
++              render_node ? render_node : "(any)");
++      return false;
++   }
++
++   VkPhysicalDeviceProperties2 props = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
++   };
++   vk.GetPhysicalDeviceProperties2(vk.pdev, &props);
++   log_msg("allocating window buffers on %s", props.properties.deviceName);
++
++   const float priority = 1.0f;
++   const VkDeviceQueueCreateInfo queue_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = 0,
++      .queueCount = 1,
++      .pQueuePriorities = &priority,
++   };
++   const VkDeviceCreateInfo dev_info = {
++      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++      .queueCreateInfoCount = 1,
++      .pQueueCreateInfos = &queue_info,
++      .enabledExtensionCount = sizeof(device_exts) / sizeof(*device_exts),
++      .ppEnabledExtensionNames = device_exts,
++   };
++   if (vk.CreateDevice(vk.pdev, &dev_info, NULL, &vk.dev) != VK_SUCCESS) {
++      log_msg("%s", "vkCreateDevice failed");
++      return false;
++   }
++
++   vk.GetPhysicalDeviceMemoryProperties(vk.pdev, &vk.mem_props);
++
++   return true;
++}
++
++static VkFormat
++drm_format_to_vk(uint32_t drm_format)
++{
++   /* DRM fourccs are little-endian packed, Vulkan UNORM8 formats are byte
++    * order: ABGR8888 is R,G,B,A in memory.
++    */
++   switch (drm_format) {
++   case DRM_FORMAT_ABGR8888:
++   case DRM_FORMAT_XBGR8888:
++      return VK_FORMAT_R8G8B8A8_UNORM;
++   case DRM_FORMAT_ARGB8888:
++   case DRM_FORMAT_XRGB8888:
++      return VK_FORMAT_B8G8R8A8_UNORM;
++   case DRM_FORMAT_RGB565:
++      return VK_FORMAT_R5G6B5_UNORM_PACK16;
++   case DRM_FORMAT_ABGR2101010:
++   case DRM_FORMAT_XBGR2101010:
++      return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++   case DRM_FORMAT_ABGR16161616F:
++   case DRM_FORMAT_XBGR16161616F:
++      return VK_FORMAT_R16G16B16A16_SFLOAT;
++   default:
++      return VK_FORMAT_UNDEFINED;
++   }
++}
++
++static VkImageUsageFlags
++usage_from_flags(uint32_t flags)
++{
++   VkImageUsageFlags usage =
++      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++   if (flags & (VCMD_ALLOC_DMABUF_IMAGE_FLAG_TEXTURE |
++                VCMD_ALLOC_DMABUF_IMAGE_FLAG_SCANOUT))
++      usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
++   if (flags & VCMD_ALLOC_DMABUF_IMAGE_FLAG_RENDER)
++      usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++   return usage;
++}
++
++static VkFormatFeatureFlags
++features_from_usage(VkImageUsageFlags usage)
++{
++   VkFormatFeatureFlags features =
++      VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
++   if (usage & VK_IMAGE_USAGE_SAMPLED_BIT)
++      features |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
++   if (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
++      features |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
++   return features;
++}
++
++static bool
++modifier_allowed(uint64_t modifier, const struct vtest_vk_alloc_request *req)
++{
++   if (!req->modifier_count)
++      return true;
++   for (uint32_t i = 0; i < req->modifier_count; i++) {
++      if (req->modifiers[i] == modifier)
++         return true;
++   }
++   return false;
++}
++
++static bool
++modifier_exportable(VkFormat format,
++                    VkImageUsageFlags usage,
++                    uint64_t modifier,
++                    const struct vtest_vk_alloc_request *req)
++{
++   const VkPhysicalDeviceImageDrmFormatModifierInfoEXT mod_info = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
++      .drmFormatModifier = modifier,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   const VkPhysicalDeviceExternalImageFormatInfo ext_info = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
++      .pNext = &mod_info,
++      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++   };
++   const VkPhysicalDeviceImageFormatInfo2 info = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
++      .pNext = &ext_info,
++      .format = format,
++      .type = VK_IMAGE_TYPE_2D,
++      .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++      .usage = usage,
++   };
++   VkExternalImageFormatProperties ext_props = {
++      .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
++   };
++   VkImageFormatProperties2 props = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
++      .pNext = &ext_props,
++   };
++   if (vk.GetPhysicalDeviceImageFormatProperties2(vk.pdev, &info, &props) !=
++       VK_SUCCESS)
++      return false;
++
++   const VkExternalMemoryFeatureFlags feats =
++      ext_props.externalMemoryProperties.externalMemoryFeatures;
++   return (feats & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
++          req->width <= props.imageFormatProperties.maxExtent.width &&
++          req->height <= props.imageFormatProperties.maxExtent.height;
++}
++
++/* Fills mods with the modifiers usable for this request, in driver order. */
++static uint32_t
++pick_modifiers(VkFormat format,
++               VkImageUsageFlags usage,
++               const struct vtest_vk_alloc_request *req,
++               uint64_t *mods)
++{
++   VkDrmFormatModifierPropertiesEXT props[MAX_MODIFIERS];
++   VkDrmFormatModifierPropertiesListEXT list = {
++      .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
++      .drmFormatModifierCount = MAX_MODIFIERS,
++      .pDrmFormatModifierProperties = props,
++   };
++   VkFormatProperties2 format_props = {
++      .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
++      .pNext = &list,
++   };
++   vk.GetPhysicalDeviceFormatProperties2(vk.pdev, format, &format_props);
++
++   const VkFormatFeatureFlags features = features_from_usage(usage);
++   uint32_t count = 0;
++   for (uint32_t i = 0; i < list.drmFormatModifierCount; i++) {
++      const uint64_t mod = props[i].drmFormatModifier;
++      if (props[i].drmFormatModifierPlaneCount != 1 ||
++          (props[i].drmFormatModifierTilingFeatures & features) != features ||
++          !modifier_allowed(mod, req) ||
++          !modifier_exportable(format, usage, mod, req))
++         continue;
++      mods[count++] = mod;
++   }
++   return count;
++}
++
++static uint32_t
++pick_memory_type(uint32_t type_bits)
++{
++   for (uint32_t i = 0; i < vk.mem_props.memoryTypeCount; i++) {
++      if ((type_bits & (1u << i)) &&
++          (vk.mem_props.memoryTypes[i].propertyFlags &
++           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++         return i;
++   }
++   for (uint32_t i = 0; i < vk.mem_props.memoryTypeCount; i++) {
++      if (type_bits & (1u << i))
++         return i;
++   }
++   return UINT32_MAX;
++}
++
++int
++vtest_vk_alloc_dmabuf_image(const char *render_node,
++                            const struct vtest_vk_alloc_request *req,
++                            struct vtest_vk_alloc_result *out)
++{
++   if (!vk.initialized) {
++      vk.initialized = true;
++      vk.ok = vk_init(render_node);
++   }
++   if (!vk.ok)
++      return -ENODEV;
++
++   const VkFormat format = drm_format_to_vk(req->drm_format);
++   if (format == VK_FORMAT_UNDEFINED || !req->width || !req->height)
++      return -EINVAL;
++
++   const VkImageUsageFlags usage = usage_from_flags(req->flags);
++   uint64_t mods[MAX_MODIFIERS];
++   const uint32_t mod_count = pick_modifiers(format, usage, req, mods);
++   if (!mod_count)
++      return -ENOTSUP;
++
++   const VkImageDrmFormatModifierListCreateInfoEXT mod_list = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
++      .drmFormatModifierCount = mod_count,
++      .pDrmFormatModifiers = mods,
++   };
++   const VkExternalMemoryImageCreateInfo ext_info = {
++      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
++      .pNext = &mod_list,
++      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++   };
++   const VkImageCreateInfo image_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .pNext = &ext_info,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = format,
++      .extent = { req->width, req->height, 1 },
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++      .usage = usage,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++   };
++   VkImage image;
++   if (vk.CreateImage(vk.dev, &image_info, NULL, &image) != VK_SUCCESS)
++      return -ENOMEM;
++
++   int ret = -ENOMEM;
++   VkDeviceMemory mem = VK_NULL_HANDLE;
++
++   VkImageDrmFormatModifierPropertiesEXT mod_props = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT,
++   };
++   if (vk.GetImageDrmFormatModifierPropertiesEXT(vk.dev, image, &mod_props) !=
++       VK_SUCCESS)
++      goto out;
++
++   const VkImageSubresource subres = {
++      .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
++   };
++   VkSubresourceLayout layout;
++   vk.GetImageSubresourceLayout(vk.dev, image, &subres, &layout);
++
++   VkMemoryDedicatedRequirements dedicated_reqs = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
++   };
++   VkMemoryRequirements2 reqs = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
++      .pNext = &dedicated_reqs,
++   };
++   const VkImageMemoryRequirementsInfo2 reqs_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
++      .image = image,
++   };
++   vk.GetImageMemoryRequirements2(vk.dev, &reqs_info, &reqs);
++
++   const uint32_t mem_type = pick_memory_type(reqs.memoryRequirements.memoryTypeBits);
++   if (mem_type == UINT32_MAX)
++      goto out;
++
++   const VkMemoryDedicatedAllocateInfo dedicated_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
++      .image = image,
++   };
++   const VkExportMemoryAllocateInfo export_info = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
++      .pNext = &dedicated_info,
++      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++   };
++   const VkMemoryAllocateInfo alloc_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .pNext = &export_info,
++      .allocationSize = reqs.memoryRequirements.size,
++      .memoryTypeIndex = mem_type,
++   };
++   if (vk.AllocateMemory(vk.dev, &alloc_info, NULL, &mem) != VK_SUCCESS)
++      goto out;
++   if (vk.BindImageMemory(vk.dev, image, mem, 0) != VK_SUCCESS)
++      goto out;
++
++   const VkMemoryGetFdInfoKHR fd_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
++      .memory = mem,
++      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++   };
++   int fd = -1;
++   if (vk.GetMemoryFdKHR(vk.dev, &fd_info, &fd) != VK_SUCCESS || fd < 0)
++      goto out;
++
++   const off_t fd_size = lseek(fd, 0, SEEK_END);
++   out->fd = fd;
++   out->modifier = mod_props.drmFormatModifier;
++   out->stride = (uint32_t)layout.rowPitch;
++   out->offset = (uint32_t)layout.offset;
++   out->size = fd_size > 0 ? (uint64_t)fd_size : reqs.memoryRequirements.size;
++   ret = 0;
++
++out:
++   /* the exported dma-buf holds its own reference to the allocation */
++   if (mem != VK_NULL_HANDLE)
++      vk.FreeMemory(vk.dev, mem, NULL);
++   vk.DestroyImage(vk.dev, image, NULL);
++   return ret;
++}
++
++void
++vtest_vk_alloc_fini(void)
++{
++   if (vk.dev)
++      vk.DestroyDevice(vk.dev, NULL);
++   if (vk.instance)
++      vk.DestroyInstance(vk.instance, NULL);
++   if (vk.lib)
++      dlclose(vk.lib);
++   memset(&vk, 0, sizeof(vk));
++}
+diff --git a/vtest/vtest_vk_alloc.h b/vtest/vtest_vk_alloc.h
+new file mode 100644
+index 00000000..16ba52da
+--- /dev/null
++++ b/vtest/vtest_vk_alloc.h
+@@ -0,0 +1,43 @@
++/*
++ * Copyright 2026 waydroid-nvidia contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef VTEST_VK_ALLOC_H
++#define VTEST_VK_ALLOC_H
++
++#include <stdint.h>
++
++struct vtest_vk_alloc_request {
++   uint32_t width;
++   uint32_t height;
++   uint32_t drm_format;
++   uint32_t flags; /* enum vcmd_alloc_dmabuf_image_flag */
++
++   /* allowed modifiers, e.g. the compositor's list; 0 = any the device has */
++   uint32_t modifier_count;
++   const uint64_t *modifiers;
++};
++
++struct vtest_vk_alloc_result {
++   int fd;
++   uint64_t modifier;
++   uint32_t stride;
++   uint32_t offset;
++   uint64_t size;
++};
++
++/* Allocates an exportable, device-local image on the host Vulkan device that
++ * matches render_node (or the first device with the required extensions) and
++ * exports it as a dma-buf.  The image and memory are released right away; the
++ * dma-buf keeps the allocation alive.  Returns 0 or a negative errno.
++ */
++int
++vtest_vk_alloc_dmabuf_image(const char *render_node,
++                            const struct vtest_vk_alloc_request *req,
++                            struct vtest_vk_alloc_result *out);
++
++void
++vtest_vk_alloc_fini(void);
++
++#endif /* VTEST_VK_ALLOC_H */
+-- 
+2.56.0
+

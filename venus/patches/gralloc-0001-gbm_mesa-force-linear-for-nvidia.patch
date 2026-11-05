@@ -1,0 +1,155 @@
+From 80f81b7d694b932d2057bcdfa369ee37e11c0fd8 Mon Sep 17 00:00:00 2001
+From: caoanhhao <dev@skyperry.com>
+Date: Thu, 5 Nov 2026 11:59:04 +0700
+Subject: [PATCH] gbm_mesa: gralloc.gbm.linear forces LINEAR for NVIDIA/Venus
+ import
+
+When gralloc.gbm.linear=1, allocate every buffer LINEAR, pad the width so
+the stride is a multiple of 128 bytes (NVIDIA ignores smaller pitches),
+and clflush the buffer once after allocation because NVIDIA accesses
+imported dma-bufs without snooping the CPU caches.
+
+caoanhhao used AI to code
+---
+ gbm_mesa_driver/gbm_mesa_wrapper.cpp | 92 +++++++++++++++++++++++++++-
+ 1 file changed, 89 insertions(+), 3 deletions(-)
+
+diff --git a/gbm_mesa_driver/gbm_mesa_wrapper.cpp b/gbm_mesa_driver/gbm_mesa_wrapper.cpp
+index fb5af2b..8f63da4 100644
+--- a/gbm_mesa_driver/gbm_mesa_wrapper.cpp
++++ b/gbm_mesa_driver/gbm_mesa_wrapper.cpp
+@@ -25,6 +25,13 @@
+ #include <errno.h>
+ #include <log/log.h>
+ #include <sys/mman.h>
++#include <sys/ioctl.h>
++#include <linux/dma-buf.h>
++#include <unistd.h>
++
++#if defined(__x86_64__) || defined(__i386__)
++#include <immintrin.h>
++#endif
+ 
+ #include <cutils/properties.h>
+ 
+@@ -117,16 +124,85 @@ static void gbm_mesa_dev_destroy(struct gbm_device *gbm)
+ 	gbm_device_destroy(gbm);
+ }
+ 
++/* Waydroid + Venus on NVIDIA: NVIDIA can only use LINEAR buffers allocated here, it needs the
++ * row pitch aligned to 128 bytes, and it accesses imported dma-bufs without snooping the CPU
++ * caches. Setting gralloc.gbm.linear=1 forces LINEAR for every allocation, pads the width so the
++ * stride is 128-byte aligned, and flushes the buffer's CPU cache lines once after allocation. */
++#define LINEAR_PROP "gralloc.gbm.linear"
++#define NVIDIA_PITCH_ALIGN 128
++
++static uint32_t gbm_format_cpp(uint32_t gbm_format)
++{
++	switch (gbm_format) {
++	case GBM_FORMAT_R8:
++		return 1;
++	case GBM_FORMAT_GR88:
++	case GBM_FORMAT_ARGB1555:
++	case GBM_FORMAT_RGB565:
++		return 2;
++	case GBM_FORMAT_XBGR16161616F:
++	case GBM_FORMAT_ABGR16161616F:
++		return 8;
++	default:
++		return 4;
++	}
++}
++
++/* Smallest width >= width whose row of pixels is a multiple of NVIDIA_PITCH_ALIGN bytes. */
++static uint32_t pitch_aligned_width(uint32_t width, uint32_t gbm_format)
++{
++	uint32_t cpp = gbm_format_cpp(gbm_format);
++	uint32_t px_align = NVIDIA_PITCH_ALIGN / cpp;
++	return (width + px_align - 1) / px_align * px_align;
++}
++
++/* Write back and invalidate every CPU cache line of the buffer, so no dirty line (e.g. from the
++ * kernel zeroing fresh pages) can later overwrite what a non-snooping GPU wrote. */
++static void flush_cpu_caches(int fd)
++{
++#if defined(__x86_64__) || defined(__i386__)
++	off_t size = lseek(fd, 0, SEEK_END);
++	lseek(fd, 0, SEEK_SET);
++	if (size <= 0) {
++		ALOGE("flush: cannot get dma-buf size");
++		return;
++	}
++
++	char *addr = (char *)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++	if (addr == MAP_FAILED) {
++		ALOGE("flush: mmap of dma-buf failed (errno %d)", errno);
++		return;
++	}
++
++	struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW };
++	ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
++	for (off_t off = 0; off < size; off += 64)
++		_mm_clflush(addr + off);
++	_mm_mfence();
++	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW;
++	ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
++
++	munmap(addr, size);
++#else
++	(void)fd;
++#endif
++}
++
+ // ALLOCATOR_ONLY!
+ static int gbm_mesa_alloc(struct alloc_args *args)
+ {
+ 	struct gbm_bo *bo = NULL;
+ 
+ 	uint32_t gbm_format = get_gbm_mesa_format(args->drm_format);
++	bool nvidia_linear = property_get_bool(LINEAR_PROP, false);
++	uint32_t alloc_width = args->width;
+ 	int usage = 0;
+-	if (args->force_linear)
++	if (args->force_linear || nvidia_linear)
+ 		usage |= GBM_BO_USE_LINEAR;
+ 
++	if (nvidia_linear)
++		alloc_width = pitch_aligned_width(args->width, gbm_format);
++
+ 	if (args->use_scanout)
+ 		usage |= GBM_BO_USE_SCANOUT;
+ 
+@@ -137,11 +213,11 @@ static int gbm_mesa_alloc(struct alloc_args *args)
+ 			usage2 &= ~GBM_BO_USE_LINEAR;
+ 			modifiers = {DRM_FORMAT_MOD_LINEAR};
+ 		}
+-		bo = gbm_bo_create_with_modifiers2(args->gbm, args->width, args->height, gbm_format, modifiers.data(), modifiers.size(), usage2);
++		bo = gbm_bo_create_with_modifiers2(args->gbm, alloc_width, args->height, gbm_format, modifiers.data(), modifiers.size(), usage2);
+ 	}
+ 	if (!bo) {
+ 		ALOGV("fallback to gbm_bo_create without modifiers");
+-		bo = gbm_bo_create(args->gbm, args->width, args->height, gbm_format, usage);
++		bo = gbm_bo_create(args->gbm, alloc_width, args->height, gbm_format, usage);
+ 	}
+ 
+ 	if (!bo) {
+@@ -157,6 +233,16 @@ static int gbm_mesa_alloc(struct alloc_args *args)
+ 	args->out_stride = gbm_bo_get_stride(bo);
+ 	args->out_modifier = gbm_bo_get_modifier(bo);
+ 
++	if (nvidia_linear) {
++		if (args->out_modifier != DRM_FORMAT_MOD_LINEAR ||
++		    args->out_stride % NVIDIA_PITCH_ALIGN != 0)
++			ALOGE(LINEAR_PROP ": got modifier 0x%llx stride %u for %ux%u fmt 0x%x, "
++			      "NVIDIA cannot import it",
++			      (unsigned long long)args->out_modifier, args->out_stride, args->width,
++			      args->height, args->drm_format);
++		flush_cpu_caches(args->out_fd);
++	}
++
+ 	/* Buffer is now handled through the system via out_fd, we can now destroy gbm_mesa bo */
+ 	gbm_bo_destroy(bo);
+ 
+-- 
+2.56.0
+

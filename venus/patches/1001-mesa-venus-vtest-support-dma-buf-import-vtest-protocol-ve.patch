@@ -1,0 +1,266 @@
+From aca424fcde57128b3ca90d073fdcd1a02742c5dc Mon Sep 17 00:00:00 2001
+From: caoanhhao <caoanhhao2@gmail.com>
+Date: Thu, 5 Nov 2026 11:44:27 +0700
+Subject: [PATCH] venus/vtest: support dma-buf import (vtest protocol version
+ 5)
+
+Add VCMD_RESOURCE_IMPORT_BLOB to the vtest protocol header and
+implement vtest_bo_create_from_dma_buf: send the dma-buf fd to the
+server with SCM_RIGHTS and wrap the returned res_id in a bo that keeps
+its own dup of the fd for mmap and export.  Imports are not deduped
+(vtest has no gem handle to key on), so each import is a new resource.
+
+The client asks for protocol version 5 and only sets
+has_dma_buf_import and create_from_dma_buf when the server agrees, so
+older servers keep the previous behavior.  vn_renderer_bo_create_from_dma_buf
+now fails with VK_ERROR_INVALID_EXTERNAL_HANDLE instead of calling a
+NULL op when import is unsupported.
+
+caoanhhao used AI to code
+---
+ src/virtio/vtest/vtest_protocol.h      |  17 +++-
+ src/virtio/vulkan/vn_physical_device.c |   5 +-
+ src/virtio/vulkan/vn_renderer.h        |   4 +
+ src/virtio/vulkan/vn_renderer_vtest.c  | 127 ++++++++++++++++++++++++-
+ 4 files changed, 148 insertions(+), 5 deletions(-)
+
+diff --git a/src/virtio/vtest/vtest_protocol.h b/src/virtio/vtest/vtest_protocol.h
+index 1bd515c..d6728e8 100644
+--- a/src/virtio/vtest/vtest_protocol.h
++++ b/src/virtio/vtest/vtest_protocol.h
+@@ -27,7 +27,7 @@
+ 
+ #define VTEST_DEFAULT_SOCKET_NAME "/tmp/.virgl_test"
+ 
+-#define VTEST_PROTOCOL_VERSION 4
++#define VTEST_PROTOCOL_VERSION 5
+ 
+ /* 32-bit length field */
+ /* 32-bit cmd field */
+@@ -94,6 +94,9 @@
+ #define VCMD_DRM_SYNC_TRANSFER 37
+ #define VCMD_RESOURCE_EXPORT_FD 38
+ 
++/* since protocol version 5 */
++#define VCMD_RESOURCE_IMPORT_BLOB 39
++
+ #define VCMD_RES_CREATE_SIZE 10
+ #define VCMD_RES_CREATE_RES_HANDLE 0 /* must be 0 since protocol version 3 */
+ #define VCMD_RES_CREATE_TARGET 1
+@@ -349,4 +352,16 @@ struct vcmd_submit_cmd2_batch {
+ #define VCMD_RESOURCE_EXPORT_FD_RES_HANDLE 0
+ /* rsp fd */
+ 
++enum vcmd_blob_fd_type {
++   VCMD_BLOB_FD_TYPE_DMABUF = 1,
++};
++
++#define VCMD_RESOURCE_IMPORT_BLOB_SIZE 4
++#define VCMD_RESOURCE_IMPORT_BLOB_TYPE 0    /* enum vcmd_blob_type, must be HOST3D */
++#define VCMD_RESOURCE_IMPORT_BLOB_FD_TYPE 1 /* enum vcmd_blob_fd_type */
++#define VCMD_RESOURCE_IMPORT_BLOB_SIZE_LO 2 /* 0 means lseek(fd, 0, SEEK_END) */
++#define VCMD_RESOURCE_IMPORT_BLOB_SIZE_HI 3
++/* req fd (SCM_RIGHTS, sent after the command data) */
++/* rsp res_id (0 on failure) */
++
+ #endif /* VTEST_PROTOCOL */
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index 2255dc4..fedab3f 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -1036,8 +1036,9 @@ vn_physical_device_init_external_memory(
+     * the renderer runs on Windows, VK_KHR_external_memory_win32 might be
+     * required for the same.
+     *
+-    * For vtest, the protocol does not support external memory import. So we
+-    * only mask out the importable bit so that wsi over vtest can be supported.
++    * For vtest before protocol version 5, the protocol does not support
++    * external memory import. So we only mask out the importable bit so that
++    * wsi over vtest can be supported.
+     */
+    if (physical_dev->renderer_extensions.EXT_external_memory_dma_buf) {
+       physical_dev->external_memory.renderer_handle_type =
+diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+index ea224ea..c89f268 100644
+--- a/src/virtio/vulkan/vn_renderer.h
++++ b/src/virtio/vulkan/vn_renderer.h
+@@ -331,6 +331,10 @@ vn_renderer_bo_create_from_dma_buf(struct vn_renderer *renderer,
+                                    VkMemoryPropertyFlags flags,
+                                    struct vn_renderer_bo **out_bo)
+ {
++   /* vtest before protocol version 5 cannot import */
++   if (!renderer->bo_ops.create_from_dma_buf)
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++
+    struct vn_renderer_bo *bo;
+    VkResult result =
+       renderer->bo_ops.create_from_dma_buf(renderer, size, fd, flags, &bo);
+diff --git a/src/virtio/vulkan/vn_renderer_vtest.c b/src/virtio/vulkan/vn_renderer_vtest.c
+index 6b8d3e6..dccea65 100644
+--- a/src/virtio/vulkan/vn_renderer_vtest.c
++++ b/src/virtio/vulkan/vn_renderer_vtest.c
+@@ -28,6 +28,9 @@
+ #define VTEST_PCI_VENDOR_ID 0x1af4
+ #define VTEST_PCI_DEVICE_ID 0x1050
+ 
++/* VCMD_RESOURCE_IMPORT_BLOB */
++#define VTEST_DMA_BUF_IMPORT_PROTOCOL_VERSION 5
++
+ struct vtest;
+ 
+ struct vtest_shmem {
+@@ -367,6 +370,71 @@ vtest_vcmd_resource_unref(struct vtest *vtest, uint32_t res_id)
+    vtest_write(vtest, vcmd_res_unref, sizeof(vcmd_res_unref));
+ }
+ 
++static void
++vtest_send_fd(struct vtest *vtest, int fd)
++{
++   char cmsg_buf[CMSG_SPACE(sizeof(int))] = { 0 };
++   char dummy = 0;
++   struct msghdr msg = {
++      .msg_iov =
++         &(struct iovec){
++            .iov_base = &dummy,
++            .iov_len = sizeof(dummy),
++         },
++      .msg_iovlen = 1,
++      .msg_control = cmsg_buf,
++      .msg_controllen = sizeof(cmsg_buf),
++   };
++
++   struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
++   cmsg->cmsg_level = SOL_SOCKET;
++   cmsg->cmsg_type = SCM_RIGHTS;
++   cmsg->cmsg_len = CMSG_LEN(sizeof(int));
++   memcpy(CMSG_DATA(cmsg), &fd, sizeof(fd));
++
++   ssize_t ret;
++   do {
++      ret = sendmsg(vtest->sock_fd, &msg, 0);
++   } while (ret < 0 && errno == EINTR);
++   if (ret < 0) {
++      vn_log(vtest->instance, "sendmsg failed: %s", strerror(errno));
++      abort();
++   }
++}
++
++static uint32_t
++vtest_vcmd_resource_import_blob(struct vtest *vtest,
++                                VkDeviceSize size,
++                                int fd)
++{
++   uint32_t vtest_hdr[VTEST_HDR_SIZE];
++   uint32_t vcmd_res_import_blob[VCMD_RESOURCE_IMPORT_BLOB_SIZE];
++
++   vtest_hdr[VTEST_CMD_LEN] = VCMD_RESOURCE_IMPORT_BLOB_SIZE;
++   vtest_hdr[VTEST_CMD_ID] = VCMD_RESOURCE_IMPORT_BLOB;
++
++   vcmd_res_import_blob[VCMD_RESOURCE_IMPORT_BLOB_TYPE] =
++      VCMD_BLOB_TYPE_HOST3D;
++   vcmd_res_import_blob[VCMD_RESOURCE_IMPORT_BLOB_FD_TYPE] =
++      VCMD_BLOB_FD_TYPE_DMABUF;
++   vcmd_res_import_blob[VCMD_RESOURCE_IMPORT_BLOB_SIZE_LO] = (uint32_t)size;
++   vcmd_res_import_blob[VCMD_RESOURCE_IMPORT_BLOB_SIZE_HI] =
++      (uint32_t)(size >> 32);
++
++   vtest_write(vtest, vtest_hdr, sizeof(vtest_hdr));
++   vtest_write(vtest, vcmd_res_import_blob, sizeof(vcmd_res_import_blob));
++   vtest_send_fd(vtest, fd);
++
++   vtest_read(vtest, vtest_hdr, sizeof(vtest_hdr));
++   assert(vtest_hdr[VTEST_CMD_LEN] == 1);
++   assert(vtest_hdr[VTEST_CMD_ID] == VCMD_RESOURCE_IMPORT_BLOB);
++
++   uint32_t res_id;
++   vtest_read(vtest, &res_id, sizeof(res_id));
++
++   return res_id;
++}
++
+ static uint32_t
+ vtest_vcmd_sync_create(struct vtest *vtest, uint64_t initial_val)
+ {
+@@ -742,6 +810,57 @@ vtest_bo_create_from_device_memory(
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++vtest_bo_create_from_dma_buf(struct vn_renderer *renderer,
++                             VkDeviceSize size,
++                             int fd,
++                             VkMemoryPropertyFlags flags,
++                             struct vn_renderer_bo **out_bo)
++{
++   struct vtest *vtest = (struct vtest *)renderer;
++
++   /* Unlike virtgpu, there is no gem handle to dedup imports of the same
++    * dma-buf, so every import is a new resource.  The renderer side owns a
++    * dup of the fd; we keep our own dup for mmap and export.
++    */
++   const off_t dma_buf_size = lseek(fd, 0, SEEK_END);
++   if (dma_buf_size <= 0 || (VkDeviceSize)dma_buf_size < size)
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++
++   const int res_fd = os_dupfd_cloexec(fd);
++   if (res_fd < 0)
++      return VK_ERROR_TOO_MANY_OBJECTS;
++
++   mtx_lock(&vtest->sock_mutex);
++   const uint32_t res_id =
++      vtest_vcmd_resource_import_blob(vtest, dma_buf_size, fd);
++   mtx_unlock(&vtest->sock_mutex);
++
++   if (!res_id) {
++      close(res_fd);
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++
++   /* see virtgpu_bo_create_from_dma_buf */
++   const uint32_t blob_flags =
++      VCMD_BLOB_FLAG_SHAREABLE | vtest_bo_blob_flags(flags, 0);
++
++   struct vtest_bo *bo = util_sparse_array_get(&vtest->bo_array, res_id);
++   *bo = (struct vtest_bo){
++      .base = {
++         .refcount = VN_REFCOUNT_INIT(1),
++         .res_id = res_id,
++         .mmap_size = (blob_flags & VCMD_BLOB_FLAG_MAPPABLE) ? dma_buf_size : 0,
++      },
++      .res_fd = res_fd,
++      .blob_flags = blob_flags,
++   };
++
++   *out_bo = &bo->base;
++
++   return VK_SUCCESS;
++}
++
+ static void
+ vtest_shmem_destroy_now(struct vn_renderer *renderer,
+                         struct vn_renderer_shmem *_shmem)
+@@ -905,7 +1024,8 @@ vtest_init_renderer_info(struct vtest *vtest)
+    info->pci.vendor_id = VTEST_PCI_VENDOR_ID;
+    info->pci.device_id = VTEST_PCI_DEVICE_ID;
+ 
+-   info->has_dma_buf_import = false;
++   info->has_dma_buf_import =
++      vtest->protocol_version >= VTEST_DMA_BUF_IMPORT_PROTOCOL_VERSION;
+    info->has_external_sync = true;
+    info->has_timeline_sync = !VN_PERF(NO_TIMELINE_SYNC);
+    info->has_implicit_fencing = false;
+@@ -1051,7 +1171,10 @@ vtest_init(struct vtest *vtest)
+ 
+    vtest->base.bo_ops.create_from_device_memory =
+       vtest_bo_create_from_device_memory;
+-   vtest->base.bo_ops.create_from_dma_buf = NULL;
++   vtest->base.bo_ops.create_from_dma_buf =
++      vtest->protocol_version >= VTEST_DMA_BUF_IMPORT_PROTOCOL_VERSION
++         ? vtest_bo_create_from_dma_buf
++         : NULL;
+    vtest->base.bo_ops.destroy = vtest_bo_destroy;
+    vtest->base.bo_ops.export_dma_buf = vtest_bo_export_dma_buf;
+    vtest->base.bo_ops.export_sync_file =
+-- 
+2.56.0
+

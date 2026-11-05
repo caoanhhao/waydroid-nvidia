@@ -1,0 +1,66 @@
+From a4f948ecccd224ccf18f4a3903c6b0cfb6f729f8 Mon Sep 17 00:00:00 2001
+From: caoanhhao <caoanhhao2@gmail.com>
+Date: Thu, 5 Nov 2026 11:38:21 +0700
+Subject: [PATCH] venus: fall back to default queue priority when global
+ priority is not permitted
+
+Android HWUI (launcher3 sets a high context priority) chains
+VkDeviceQueueGlobalPriorityCreateInfo with HIGH priority and asserts on
+vkCreateDevice failure. The host NVIDIA driver returns
+VK_ERROR_NOT_PERMITTED for HIGH/REALTIME queues when the render server
+lacks CAP_SYS_NICE. Retry device creation with those queues at the
+default priority.
+
+caoanhhao used AI to code
+---
+ src/virtio/vulkan/vn_device.c | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/src/virtio/vulkan/vn_device.c b/src/virtio/vulkan/vn_device.c
+index f42b9f9..31cfdc2 100644
+--- a/src/virtio/vulkan/vn_device.c
++++ b/src/virtio/vulkan/vn_device.c
+@@ -508,6 +508,40 @@ vn_device_init(struct vn_device *dev,
+    }
+    result = vn_call_vkCreateDevice(dev->primary_ring, physical_dev_handle,
+                                    &final_create_info, NULL, &dev_handle);
++
++   /* The renderer may lack the privilege for elevated global priorities
++    * (e.g. NVIDIA requires CAP_SYS_NICE for HIGH/REALTIME queues), while
++    * apps like Android HWUI request them and treat failure as fatal.  Retry
++    * with such queues at the default priority.  The global priority struct
++    * is the only VkDeviceQueueCreateInfo pNext that is encoded, so dropping
++    * the chain of those queues is enough.
++    */
++   if (result == VK_ERROR_NOT_PERMITTED) {
++      bool lowered = false;
++      if (final_create_info.pQueueCreateInfos != queue_infos) {
++         typed_memcpy(queue_infos, create_info->pQueueCreateInfos,
++                      create_info->queueCreateInfoCount);
++         final_create_info.pQueueCreateInfos = queue_infos;
++      }
++      for (uint32_t i = 0; i < create_info->queueCreateInfoCount; i++) {
++         const VkDeviceQueueGlobalPriorityCreateInfo *prio =
++            vk_find_struct_const(queue_infos[i].pNext,
++                                 DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO);
++         if (prio &&
++             prio->globalPriority > VK_QUEUE_GLOBAL_PRIORITY_MEDIUM) {
++            queue_infos[i].pNext = NULL;
++            lowered = true;
++         }
++      }
++      if (lowered) {
++         if (VN_DEBUG(INIT))
++            vn_log(instance, "global priority not permitted; using default");
++         result = vn_call_vkCreateDevice(dev->primary_ring,
++                                         physical_dev_handle,
++                                         &final_create_info, NULL,
++                                         &dev_handle);
++      }
++   }
+    STACK_ARRAY_FINISH(queue_infos);
+ 
+    /* free the fixed extensions here since no longer needed below */
+-- 
+2.56.0
+
