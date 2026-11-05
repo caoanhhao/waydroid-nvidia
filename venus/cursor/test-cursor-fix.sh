@@ -3,18 +3,26 @@
 # Cause and details: venus/notes-cursor.md.
 #
 #   sh venus/cursor/test-cursor-fix.sh test    # needs a RUNNING session; no restart
-#   sh venus/cursor/test-cursor-fix.sh apply   # install the .rc, cursor_force_shm=false, restart
+#   sh venus/cursor/test-cursor-fix.sh apply   # install the composer wrapper, cursor_force_shm=false, restart
 #   sh venus/cursor/test-cursor-fix.sh check   # after apply: composer env, tombstones, logcat
-#   sh venus/cursor/test-cursor-fix.sh revert  # remove the .rc, cursor_force_shm=true, restart
+#   sh venus/cursor/test-cursor-fix.sh revert  # remove the wrapper, cursor_force_shm=true, restart
 #
-# Output is also written to venus/cursor/test-cursor-fix.txt.
+# The fix: the overlay replaces /vendor/bin/hw/android.hardware.graphics.composer@2.1-service
+# with composer-preload-wrapper (sets LD_PRELOAD=libnativewindow.so) and puts the vendor.img
+# binary next to it as ...-service.real. The earlier .rc override was not applied by init;
+# apply removes it.
+#
+# Output is also written to venus/cursor/test-cursor-fix.txt (test) and
+# venus/cursor/test-cursor-fix-apply.txt (apply, check).
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=$ROOT/venus/cursor/test-cursor-fix.txt
+OUT_APPLY=$ROOT/venus/cursor/test-cursor-fix-apply.txt
 TEST=$ROOT/venus/tests/build/android-wrap-handle-test
-RC=$ROOT/venus/cursor/zz-waydroid-hwcomposer-nativewindow.rc
+WRAPPER=$ROOT/venus/cursor/build/composer-preload-wrapper
 RC_DST=/var/lib/waydroid/overlay/vendor/etc/init/zz-waydroid-hwcomposer-nativewindow.rc
+BIN=/var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service
 CFG=/var/lib/waydroid/waydroid.cfg
 TMPDIR_A=$HOME/.local/share/waydroid/data/local/tmp
 
@@ -38,6 +46,7 @@ check() {
     echo "=== composer process"
     ws sh -c 'p=$(pidof android.hardware.graphics.composer@2.1-service); echo pid $p;
         tr "\0" "\n" < /proc/$p/environ | grep LD_PRELOAD || echo "no LD_PRELOAD";
+        ls -l /vendor/bin/hw/android.hardware.graphics.composer@2.1-service*;
         ps -o PID,ELAPSED,NAME -p $p'
     echo "=== props"
     ws getprop persist.waydroid.cursor_force_shm
@@ -63,17 +72,24 @@ test)
     ;;
 apply)
     {
-    sudo install -D -m644 "$RC" "$RC_DST"
+    img=$(sed -n 's/^images_path = //p' "$CFG")/vendor.img
+    tmp=$(mktemp -d)
+    debugfs -R "dump /bin/hw/android.hardware.graphics.composer@2.1-service $tmp/real" "$img" 2>/dev/null
+    [ -s "$tmp/real" ] || { echo "cannot read the composer from $img"; exit 1; }
+    sudo install -D -m755 "$tmp/real" "$BIN.real"
+    sudo install -D -m755 "$WRAPPER" "$BIN"
+    rm -rf "$tmp"
+    sudo rm -f "$RC_DST"
     set_prop persist.waydroid.cursor_force_shm false
     restart_waydroid
     check
-    } 2>&1 | tee "$OUT"
+    } 2>&1 | tee "$OUT_APPLY"
     ;;
 check)
-    check 2>&1 | tee "$OUT"
+    check 2>&1 | tee "$OUT_APPLY"
     ;;
 revert)
-    sudo rm -f "$RC_DST"
+    sudo rm -f "$RC_DST" "$BIN" "$BIN.real"
     set_prop persist.waydroid.cursor_force_shm true
     restart_waydroid
     ;;

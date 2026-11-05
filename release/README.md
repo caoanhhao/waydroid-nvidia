@@ -77,15 +77,43 @@ sh release/uninstall.sh
 - **The server must run before Android starts.** Without it SurfaceFlinger aborts (`no suitable
   EGLConfig found`). Restarting the service while Waydroid runs kills Android's GPU clients,
   so restart Waydroid after it (`waydroid session stop`, then open it again).
-- **The mouse pointer may be invisible** over the Waydroid window.
-  `persist.waydroid.cursor_force_shm = true` avoids a hwcomposer crash in its EGL cursor path.
-  The cursor sprite is an Intel LINEAR buffer that Hyprland on NVIDIA cannot show.
 - **Fences are CPU waits.** `failed to dup EGL native fence sync` is logged on every frame
   (Mesa patch 0001). Performance has not been measured.
-- **Multi-window mode is untested.** It uses the same composer EGL path for snapshots, so it
-  may crash. Full-UI mode works.
+- **Multi-window mode is untested.** It uses the composer EGL path fixed for the cursor
+  (below) for snapshots, but it has not been tried. Full-UI mode works.
 - **Only GLES in SurfaceFlinger is tested.** GLES apps beyond SurfaceFlinger have not been tested.
 - **The render node is fixed.** It is hardcoded as `/dev/dri/renderD129` (the 4070), and Intel
   is `renderD128`. If the numbering changes, edit the unit and `gralloc.gbm.device`.
+
+Fixed: the mouse pointer shows over the Waydroid window. Android 13 ANGLE looks up
+`AHardwareBuffer_*` only in the executable's own dependencies, and the hwcomposer does not
+link libnativewindow, so its EGL cursor path crashed. The overlay replaces
+`/vendor/bin/hw/android.hardware.graphics.composer@2.1-service` with a wrapper that execs the
+vendor.img binary (copied next to it as `.real`) with `LD_PRELOAD=libnativewindow.so`, and
+`persist.waydroid.cursor_force_shm` is no longer set. (An init `.rc` service override did not
+work: init did not apply it.) Details: `venus/notes-cursor.md`.
+
+Fixed: video apps (TikTok) no longer bring down the composer and SurfaceFlinger.
+- Software video decoders output YV12 buffers, which gralloc allocates through Intel LINEAR.
+  The hwcomposer used to pass them to Hyprland, which can't import them. That closed its
+  Wayland connection, the composer aborted, and SurfaceFlinger aborted after it.
+- The overlay now installs a shim as `/vendor/lib64/hw/hwcomposer.waydroid.so`. It loads the
+  vendor.img module (copied as `hwcomposer.waydroid.real.so`) and sends SurfaceFlinger every
+  layer whose format/modifier Hyprland does not advertise.
+- SurfaceFlinger can now import those buffers because of Mesa patch 1007: gralloc describes
+  YV12 as one plane, and Venus now builds the three-plane layout itself.
+- Each kind of layer that gets redirected is logged to `/data/waydroid_hwc_format_shim.txt`
+  (`~/.local/share/waydroid/data/` on the host).
+- `waydroid prop set persist.waydroid.hwc_unsupported drop` hides those layers instead, and
+  `off` restores the vendor behaviour.
+
+Details: `venus/notes-tiktok.md`.
+
+Fixed: the Play Store crashed on every launch (SIGFPE in libhwui `BlobCache::clean()`).
+HWUI tags each app's Skia shader cache with the GPU driver; after the switch from GLES to Vulkan
+the old cache fails that check, and Android 13's `BlobCache::clear()` keeps the old byte count.
+An app whose old cache was over 512 KiB then crashes before it saves a new one. Both
+`--system` scripts now delete `code_cache/com.android.skia.shaders_cache` for every app, and apps
+rebuild them. Details: `venus/notes-blobcache.md`.
 
 Details: `venus/notes-dmabuf.md`, `HANDOFF.md`, patches in `venus/patches/`.

@@ -57,6 +57,19 @@ set_prop() {
     sed -i "/^\[properties\]/a $1 = $2" "$CFG"
 }
 
+# Android 13 HWUI keeps a per-app Skia shader cache tagged with the GPU driver's identity.
+# When the driver changes, its BlobCache::clear() drops the entries but not the byte count,
+# so an app whose old cache was over 512 KiB crashes with SIGFPE in BlobCache::clean()
+# before it saves a new one, on every launch (venus/notes-blobcache.md). Delete the caches
+# whenever the driver changes; apps rebuild them.
+clear_shader_caches() {
+    data=$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)/.local/share/waydroid/data
+    [ -d "$data" ] || { echo "no $data: HWUI shader caches not cleared" >&2; return 0; }
+    n=$(find "$data/data" "$data/user_de" -maxdepth 4 -path '*/code_cache/com.android.skia.shaders_cache' \
+        -print -delete 2>/dev/null | wc -l)
+    echo "removed $n HWUI shader caches"
+}
+
 install_system() {
     [ "$(id -u)" = 0 ] || { echo "run the Android part with sudo: sudo sh $0 --system" >&2; exit 1; }
     LIB=/var/lib/waydroid/overlay/vendor/lib64
@@ -66,6 +79,24 @@ install_system() {
     install -D -m644 "$D/android/vulkan.virtio.so" "$LIB/hw/vulkan.virtio.so"
     install -D -m644 "$D/android/libgbm_mesa_wrapper.so" "$LIB/libgbm_mesa_wrapper.so"
     install -D -m644 "$D/android/libgbm_mesa_wrapper_intel.so" "$LIB/libgbm_mesa_wrapper_intel.so"
+    # composer: run it with libnativewindow preloaded so ANGLE's EGL image import works
+    # there. The wrapper replaces the binary; the vendor.img one moves next to it as .real.
+    BIN=/var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service
+    IMG=$(sed -n 's/^images_path = //p' "$CFG")/vendor.img
+    mkdir -p "$(dirname "$BIN")"
+    rm -f "$BIN.real"
+    debugfs -R "dump /bin/hw/android.hardware.graphics.composer@2.1-service $BIN.real" "$IMG" 2>/dev/null
+    [ -s "$BIN.real" ] || { echo "cannot read the composer from $IMG" >&2; exit 1; }
+    chmod 755 "$BIN.real"
+    install -D -m755 "$D/android/composer-preload-wrapper" "$BIN"
+    # hwcomposer: a shim module lets SurfaceFlinger compose the layers Hyprland can't
+    # import (YV12 video frames) instead of sending them to Wayland, which kills the
+    # composer. It loads the vendor.img module, copied next to it as .real.so.
+    rm -f "$LIB/hw/hwcomposer.waydroid.real.so"
+    debugfs -R "dump /lib64/hw/hwcomposer.waydroid.so $LIB/hw/hwcomposer.waydroid.real.so" "$IMG" 2>/dev/null
+    [ -s "$LIB/hw/hwcomposer.waydroid.real.so" ] || { echo "cannot read hwcomposer from $IMG" >&2; exit 1; }
+    chmod 644 "$LIB/hw/hwcomposer.waydroid.real.so"
+    install -D -m644 "$D/android/hwcomposer.waydroid.so" "$LIB/hw/hwcomposer.waydroid.so"
     sed -i 's/^mount_overlays = .*/mount_overlays = True/' "$CFG"
 
     # Vulkan: Venus over the vtest socket (host waydroid-vtest.service)
@@ -79,13 +110,15 @@ install_system() {
     set_prop gralloc.gbm.linear 1
     set_prop waydroid.gralloc.vtest 1
     set_prop debug.hwui.renderer skiavk
-    # cursor as dma-buf: the composer's EGL path crashes under ANGLE (see README)
-    set_prop persist.waydroid.cursor_force_shm true
+    # cursor through the composer's EGL readback into shm (the wrapper above fixes
+    # its crash); a dma-buf cursor is a LINEAR buffer Hyprland/NVIDIA cannot show
+    del_prop persist.waydroid.cursor_force_shm
     # leftovers from debugging
     for p in mesa.vn.debug ro.logd.size debug.renderengine.backend debug.mesa.log.level; do
         del_prop "$p"
     done
 
+    clear_shader_caches
     waydroid upgrade --offline
     systemctl restart waydroid-container
     echo "=== done ($(head -1 "$D/VERSION"))"

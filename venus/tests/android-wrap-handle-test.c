@@ -149,6 +149,10 @@ client_buffer(void)
 static void *
 egl_thread(void *arg)
 {
+   /* egl_init() */
+   EGLDisplay d = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+   eglInitialize(d, NULL, NULL);
+   /* the loader's forwarder for this crashes before eglInitialize */
    PFNEGLDEBUGMESSAGECONTROLKHRPROC debug_control =
       (PFNEGLDEBUGMESSAGECONTROLKHRPROC)eglGetProcAddress("eglDebugMessageControlKHR");
    if (debug_control) {
@@ -159,9 +163,6 @@ egl_thread(void *arg)
       debug_control(egl_debug, attribs);
    }
 
-   /* egl_init() */
-   EGLDisplay d = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-   eglInitialize(d, NULL, NULL);
    printf("EGL: %s / %s\n", eglQueryString(d, EGL_VENDOR), eglQueryString(d, EGL_VERSION));
    const EGLint cfg_attrs[] = { EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
                                 EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,

@@ -6,5 +6,6 @@
 /venus/tests/build/
 /venus/hwc-yuv/build/
 /venus/hwc-yuv/out/
+/venus/cursor/build/
 # logs and measurement output
 *.txt

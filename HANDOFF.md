@@ -36,8 +36,10 @@ Android cannot load NVIDIA's glibc driver, so Vulkan is forwarded (design: [plan
   buffers go through the Intel minigbm wrapper, forced LINEAR (`src/minigbm-wrapper`).
 - **GLES:** all of it runs on ANGLE over Venus (`ro.hardware.egl = angle`), so Intel never
   renders into NVIDIA buffers.
-- **Cursor:** sent as a dma-buf (`persist.waydroid.cursor_force_shm = true`), because the
-  composer's EGL path crashes under ANGLE.
+- **Cursor:** drawn by the composer's EGL path into shm (`cursor_force_shm` unset). The overlay
+  replaces the composer binary with `composer-preload-wrapper`, which execs the vendor.img
+  binary (`.real`) with `LD_PRELOAD=libnativewindow.so` so ANGLE's image import works there.
+  Verified 15:38 with the pointer over the window (`venus/notes-cursor.md`).
 
 ## Install / uninstall
 
@@ -76,15 +78,16 @@ Every change is also exported as a patch in `venus/patches/`.
 - `venus/notes-vkcreatedevice.md`: patch 0002 (global-priority fallback).
 - `venus/notes-dmabuf.md`: vtest v5/v6, gralloc shim, ANGLE fixes 1002–1004, cursor workaround.
 - `venus/gralloc-findings.md`: buffer layouts NVIDIA can import, and the Hyprland display path.
-- `venus/notes-cursor.md`, `venus/notes-fence.md`: open work (below).
+- `venus/notes-cursor.md`: cursor fix (composer wrapper).
+- `venus/notes-tiktok.md`: YV12 video layers (hwcomposer shim, Mesa patch 1007).
+- `venus/notes-blobcache.md`: Play Store SIGFPE from stale HWUI shader caches (cleared by the
+  `--system` scripts).
+- `venus/notes-fence.md`: open work (below).
 
 These notes are lab logs. Scripts they mention that were replaced by `release/` have been removed.
 
 ## Open work
 
-- **Cursor** (`notes-cursor.md`, `venus/cursor/`): the composer crash comes from ANGLE missing
-  `libnativewindow`. The fix is an init `.rc` preload (patch `release-0001-*`). Not yet
-  verified in Android.
 - **Fences** (`notes-fence.md`, patches 1006 / vrend-0003): real sync fds over vtest v7
   replace patch 0001's CPU wait, and the `failed to dup EGL native fence sync` warning.
   Before/after measurement in progress (`venus/fence-measure.sh`, `venus/deploy-fence.sh`).

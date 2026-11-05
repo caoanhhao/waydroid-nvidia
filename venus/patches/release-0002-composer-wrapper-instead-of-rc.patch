@@ -1,0 +1,82 @@
+diff -ru a/release/build.sh b/release/build.sh
+--- a/release/build.sh	2026-11-05 15:37:06.411909586 +0700
++++ b/release/build.sh	2026-11-05 15:37:06.448501250 +0700
+@@ -13,6 +13,7 @@
+ cp "$ROOT/src/mesa/build-android/src/virtio/vulkan/libvulkan_virtio.so" "$D/android/vulkan.virtio.so"
+ cp "$ROOT/src/minigbm-vtest/build-android/libgbm_mesa_wrapper.so" "$D/android/libgbm_mesa_wrapper.so"
+ cp "$ROOT/src/minigbm-wrapper/out/libgbm_mesa_wrapper.so" "$D/android/libgbm_mesa_wrapper_intel.so"
++cp "$ROOT/venus/cursor/build/composer-preload-wrapper" "$D/android/"
+ 
+ cp "$VB/vtest/virgl_test_server" "$VB/server/virgl_render_server" "$D/host/bin/"
+ # only the runtime soname link and the library (not the .so dev link or meson's .p dir)
+diff -ru a/release/install.sh b/release/install.sh
+--- a/release/install.sh	2026-11-05 15:37:06.411938094 +0700
++++ b/release/install.sh	2026-11-05 15:37:06.448547338 +0700
+@@ -66,6 +66,16 @@
+     install -D -m644 "$D/android/vulkan.virtio.so" "$LIB/hw/vulkan.virtio.so"
+     install -D -m644 "$D/android/libgbm_mesa_wrapper.so" "$LIB/libgbm_mesa_wrapper.so"
+     install -D -m644 "$D/android/libgbm_mesa_wrapper_intel.so" "$LIB/libgbm_mesa_wrapper_intel.so"
++    # composer: run it with libnativewindow preloaded so ANGLE's EGL image import works
++    # there. The wrapper replaces the binary; the vendor.img one moves next to it as .real.
++    BIN=/var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service
++    IMG=$(sed -n 's/^images_path = //p' "$CFG")/vendor.img
++    mkdir -p "$(dirname "$BIN")"
++    rm -f "$BIN.real"
++    debugfs -R "dump /bin/hw/android.hardware.graphics.composer@2.1-service $BIN.real" "$IMG" 2>/dev/null
++    [ -s "$BIN.real" ] || { echo "cannot read the composer from $IMG" >&2; exit 1; }
++    chmod 755 "$BIN.real"
++    install -D -m755 "$D/android/composer-preload-wrapper" "$BIN"
+     sed -i 's/^mount_overlays = .*/mount_overlays = True/' "$CFG"
+ 
+     # Vulkan: Venus over the vtest socket (host waydroid-vtest.service)
+@@ -79,8 +89,9 @@
+     set_prop gralloc.gbm.linear 1
+     set_prop waydroid.gralloc.vtest 1
+     set_prop debug.hwui.renderer skiavk
+-    # cursor as dma-buf: the composer's EGL path crashes under ANGLE (see README)
+-    set_prop persist.waydroid.cursor_force_shm true
++    # cursor through the composer's EGL readback into shm (the wrapper above fixes
++    # its crash); a dma-buf cursor is a LINEAR buffer Hyprland/NVIDIA cannot show
++    del_prop persist.waydroid.cursor_force_shm
+     # leftovers from debugging
+     for p in mesa.vn.debug ro.logd.size debug.renderengine.backend debug.mesa.log.level; do
+         del_prop "$p"
+diff -ru a/release/README.md b/release/README.md
+--- a/release/README.md	2026-11-05 15:37:06.411981577 +0700
++++ b/release/README.md	2026-11-05 15:37:06.448582422 +0700
+@@ -79,13 +79,16 @@
+   so restart Waydroid after it (`waydroid session stop`, then open it again).
+ - **Fences are CPU waits.** `failed to dup EGL native fence sync` is logged on every frame
+   (Mesa patch 0001). Performance has not been measured.
+-- **The mouse pointer may be invisible** over the Waydroid window.
+-  `persist.waydroid.cursor_force_shm = true` avoids a hwcomposer crash in its EGL cursor path:
+-  Android 13 ANGLE looks up `AHardwareBuffer_*` only in the executable's own dependencies, and
+-  the hwcomposer does not link libnativewindow. An init `.rc` with `setenv LD_PRELOAD` did not
+-  work (init did not apply the override); a fix is in progress (`venus/notes-cursor.md`).
+-- **Multi-window mode is untested.** It uses the same composer EGL path for snapshots, so it
+-  may crash. Full-UI mode works.
++- **Multi-window mode is untested.** It uses the composer EGL path fixed for the cursor
++  (below) for snapshots, but it has not been tried. Full-UI mode works.
++
++Fixed: the mouse pointer shows over the Waydroid window. Android 13 ANGLE looks up
++`AHardwareBuffer_*` only in the executable's own dependencies, and the hwcomposer does not
++link libnativewindow, so its EGL cursor path crashed. The overlay replaces
++`/vendor/bin/hw/android.hardware.graphics.composer@2.1-service` with a wrapper that execs the
++vendor.img binary (copied next to it as `.real`) with `LD_PRELOAD=libnativewindow.so`, and
++`persist.waydroid.cursor_force_shm` is no longer set. (An init `.rc` service override did not
++work: init did not apply it.) Details: `venus/notes-cursor.md`.
+ - **Only GLES in SurfaceFlinger is tested.** GLES apps beyond SurfaceFlinger have not been tested.
+ - **The render node is fixed.** It is hardcoded as `/dev/dri/renderD129` (the 4070), and Intel
+   is `renderD128`. If the numbering changes, edit the unit and `gralloc.gbm.device`.
+diff -ru a/release/uninstall.sh b/release/uninstall.sh
+--- a/release/uninstall.sh	2026-11-05 15:37:06.411961342 +0700
++++ b/release/uninstall.sh	2026-11-05 15:37:06.448559886 +0700
+@@ -13,6 +13,8 @@
+     [ "$(id -u)" = 0 ] || { echo "run with sudo: sudo sh $0 --system" >&2; exit 1; }
+     waydroid session stop 2>/dev/null || true
+     rm -f "$LIB/hw/vulkan.virtio.so" "$LIB/libgbm_mesa_wrapper.so" "$LIB/libgbm_mesa_wrapper_intel.so"
++    rm -f /var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service \
++          /var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service.real
+     for p in ro.hardware.vulkan mesa.vtest.socket.name gralloc.gbm.linear waydroid.gralloc.vtest \
+              debug.hwui.renderer persist.waydroid.cursor_force_shm mesa.vn.debug ro.logd.size \
+              debug.renderengine.backend debug.mesa.log.level ro.hardware.egl; do
