@@ -75,9 +75,16 @@ This also changes ANGLE: GLES apps now see `GL_KHR_texture_compression_astc_ldr`
 
 ## Left open
 
-- The resource download stayed at 0.0 MB/s, so the login/lobby was not reached.
+- On the first run the resource download stayed at 0.0 MB/s; a later run got through it to the Login screen.
   That is networking in the container (see the waydroid-net work), not the GPU.
-- A focused overlay (the Gemini "floaty" window) keeps the game's window black
-  until it is dismissed. That is not a driver issue.
+- "Freeze" reports: Android 13 opens the assistant when the Meta key is pressed
+  and released alone (`adb shell input keyevent KEYCODE_META_LEFT` reproduces it).
+  Hyprland's Super key reaches Android when Waydroid has focus, and the Gemini
+  "floaty" activity covers the game. UE4 pauses: 0% CPU and no new buffers. If
+  the overlay opens before the first frame, the window stays black. BACK
+  resumes it. In that state the game presents at 25 fps on the Login screen
+  (`dumpsys SurfaceFlinger --latency` on the `(BLAST)` layer), with no device
+  lost and no vtest errors. It is not a GPU issue.
+  `adb shell settings put secure assistant ""` turns the assistant off.
 - `release/dist` still holds the old driver until `sh release/build.sh` and both
   install steps run.
