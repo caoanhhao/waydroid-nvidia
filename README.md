@@ -158,8 +158,17 @@ is a long press on that spot.
    FP_PIN=1234 sh fingerprint/fp.sh enroll
    ```
 
-4. Lock the screen, then touch the sensor with an enrolled finger (unlocks), with an unknown one
-   (rejected), or force a lockout:
+4. Lock the screen (screen off and on, like a power key press):
+
+   ```bash
+   sh fingerprint/fp.sh lock
+   ```
+
+   Do not lock with Lockdown from the power menu: Android then refuses fingerprints until the
+   password is entered.
+
+5. Touch the sensor with an enrolled finger (unlocks), with an unknown one (rejected), or force a
+   lockout:
 
    ```bash
    sh fingerprint/fp.sh touch
@@ -175,7 +184,8 @@ is a long press on that spot.
 
 `sh fingerprint/fp.sh status` shows the enrolled fingers and the sensor state. The script connects
 adb to the container itself (or uses `$ANDROID_SERIAL`). Like on a phone, the PIN is needed once
-after every Android start before a fingerprint can unlock, and after a lockout. The sensor sits at
+after every Android start before a fingerprint can unlock, and after a lockout or Lockdown; `touch`
+says which one applies. The sensor sits at
 `180:560` (x:y in display pixels); for another spot run `sh fingerprint/fp.sh place`, then restart
 Waydroid. Remove everything with `sudo sh fingerprint/uninstall.sh`.
 

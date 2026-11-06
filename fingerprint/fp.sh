@@ -1,6 +1,7 @@
 #!/bin/sh
 # Drive Waydroid's virtual fingerprint sensor over adb (install it with fingerprint/install.sh).
 #
+#   sh fingerprint/fp.sh lock             lock the screen (fingerprint stays allowed)
 #   sh fingerprint/fp.sh enroll [id]      enroll finger <id> (default: next free) through Settings
 #   sh fingerprint/fp.sh touch [id]       put enrolled finger <id> (default: first) on the sensor
 #   sh fingerprint/fp.sh bad              put an unknown finger on the sensor
@@ -24,6 +25,13 @@ if [ -z "${ANDROID_SERIAL:-}" ]; then
     adb connect "$ANDROID_SERIAL" >/dev/null
 fi
 export ANDROID_SERIAL
+# after Android's framework restarts by itself (e.g. a surfaceflinger crash) its network can
+# stay down, and adb with it; only a new Waydroid session brings it back
+if ! adb shell true 2>/dev/null; then
+    echo "adb cannot reach Android at $ANDROID_SERIAL." >&2
+    echo "Restart Waydroid: waydroid session stop, then start it again." >&2
+    exit 1
+fi
 sh_() { adb shell "$@" | tr -d '\r'; }
 
 enrolled() { sh_ getprop $PP.enrollments | tr ',' ' '; }
@@ -36,17 +44,39 @@ press() {
     [ -n "$loc" ] || loc=400:1600:150 # the HAL's built-in default
     sx=${loc%%:*}; rest=${loc#*:}; sy=${rest%%:*}
     sh_ input keyevent KEYCODE_WAKEUP
-    sleep 0.3
-    win=$(sh_ dumpsys window windows | awk '
-        /Window #/ { inwin = /UdfpsControllerOverlay/ }
-        inwin && /mAttrs=/ && !a { a = $0 }
-        inwin && / frame=/ && !f { f = $0 }
-        END { print a; print f }')
-    req=$(printf '%s\n' "$win" | sed -n '1s/.*mAttrs={(\(-\{0,1\}[0-9]*\),\(-\{0,1\}[0-9]*\)).*/\1 \2/p')
-    frm=$(printf '%s\n' "$win" | sed -n '2s/.* frame=\[\(-\{0,1\}[0-9]*\),\(-\{0,1\}[0-9]*\)\].*/\1 \2/p')
+    # SystemUI puts the sensor overlay up a moment after the lock screen starts listening
+    tries=6
+    [ "${1:-}" = quiet ] && tries=1
+    while :; do
+        win=$(sh_ dumpsys window windows | awk '
+            /Window #/ { inwin = /UdfpsControllerOverlay/ }
+            inwin && /mAttrs=/ && !a { a = $0 }
+            inwin && / frame=/ && !f { f = $0 }
+            END { print a; print f }')
+        req=$(printf '%s\n' "$win" | sed -n '1s/.*mAttrs={(\(-\{0,1\}[0-9]*\),\(-\{0,1\}[0-9]*\)).*/\1 \2/p')
+        frm=$(printf '%s\n' "$win" | sed -n '2s/.* frame=\[\(-\{0,1\}[0-9]*\),\(-\{0,1\}[0-9]*\)\].*/\1 \2/p')
+        [ -z "$req" ] || [ -z "$frm" ] || break
+        tries=$((tries - 1))
+        [ $tries -gt 0 ] || break
+        sleep 0.5
+    done
     if [ -z "$req" ] || [ -z "$frm" ]; then
         [ "${1:-}" = quiet ] && return 0 # enroll: the overlay is not up yet, try again later
-        echo "warning: no UDFPS overlay on screen, nothing is waiting for a finger" >&2
+        echo "nothing is waiting for a finger (no fingerprint sensor on screen)." >&2
+        # LockSettings prints these StrongAuth flags in hex
+        flags=$(sh_ dumpsys lock_settings | sed -n 's/.*primaryAuthFlags=\([0-9a-f]*\).*/\1/p' | head -1)
+        if [ -n "$flags" ] && [ "$flags" != 0 ]; then
+            why=
+            [ $((0x$flags & 0x01)) = 0 ] || why="$why, Android just started"
+            [ $((0x$flags & 0x08)) = 0 ] || why="$why, fingerprint lockout"
+            [ $((0x$flags & 0x10)) = 0 ] || why="$why, no password for 72 h"
+            [ $((0x$flags & 0x20)) = 0 ] || why="$why, Lockdown from the power menu"
+            echo "Android wants the password first (${why#, }). Unlock with it in the" \
+                "Waydroid window, then lock with: $0 lock" >&2
+        elif [ "$(sh_ dumpsys window policy | sed -n 's/^ *showing=//p' | head -1)" != true ]; then
+            echo "The screen is not locked. Lock it with: $0 lock" >&2
+        fi
+        return 1
     else
         set -- $req $frm
         sx=$((sx - $1 + $3)); sy=$((sy - $2 + $4))
@@ -149,6 +179,14 @@ cmd_place() {
     echo "sensor at $loc; restart Waydroid (waydroid session stop) for it to take effect"
 }
 
+# Screen off then on, like the power key. The power menu's Lockdown instead turns
+# fingerprint off until the password is entered.
+cmd_lock() {
+    sh_ input keyevent KEYCODE_SLEEP
+    sleep 1
+    sh_ input keyevent KEYCODE_WAKEUP
+}
+
 cmd_status() {
     echo "device:      $ANDROID_SERIAL ($(sh_ wm size | sed -n 's/.*size: //p' | tail -1))"
     echo "type:        $(sh_ getprop $PP.type)  sensor at $(sh_ getprop $PP.sensor_location)"
@@ -161,6 +199,6 @@ cmd_status() {
 }
 
 case "${1:-}" in
-enroll | touch | bad | lockout | place | status) c=$1; shift; "cmd_$c" "$@" ;;
-*) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+lock | enroll | touch | bad | lockout | place | status) c=$1; shift; "cmd_$c" "$@" ;;
+*) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
