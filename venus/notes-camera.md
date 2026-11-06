@@ -7,9 +7,8 @@ Status 2026-11-06: **fixed and verified.**
   tombstones; SurfaceFlinger, cameraserver and the camera provider kept running.
 - The first install had only the 64-bit shim, and the preview stayed green: the camera
   provider is a **32-bit** process and loads `/vendor/lib/hw/`. Both ABIs are needed.
-- Separate bug, not fixed: taking a photo fails. Locking any BLOB buffer fails in
-  `gbm_map` (`createJpegLocked: could not lock 3145728 bytes`); the BLOB is allocated as a
-  4096xN R8 texture but imported and mapped as total_size x 1.
+- Taking a photo works too (second bug below): a 2592x1458 JPEG with correct colours is saved
+  to `DCIM/Camera`, and the camera keeps running afterwards.
 
 ## Symptom
 
@@ -80,6 +79,31 @@ expected V at 2211840, U at 2764800, chroma rowStride 1024: FAIL
 Release integration: `release/build.sh` copies the shims into `dist/android/` (64-bit) and
 `dist/android/lib/` (32-bit), `install.sh` extracts both `.real.so` and installs the shims,
 `uninstall.sh` removes them.
+
+## Second bug: taking a photo fails (BLOB lock)
+
+Symptom: pressing the shutter makes the camera HAL log `HandleImporter: failed to lock error 3`
+and `createJpegLocked: could not lock 3145728 bytes`, report a device error and reopen the
+camera; the shutter stays disabled.
+
+Cause:
+- The JPEG output is a HAL BLOB buffer: `DRM_FORMAT_R8`, width = size in bytes, height 1.
+- `gbm_mesa_bo_create` allocates such 1D R8 buffers (and spoofed formats) as a 4096-wide 2D
+  R8 texture, `4096 x ceil(size / 4096)`.
+- `gbm_mesa_bo_import` (mapper side) imports them as `size x 1` with stride 4096, and
+  `gbm_mesa_bo_map` maps `size x 1`. Mesa (iris) rejects that: the width is over the texture
+  limit and the stride is below the width. Every CPU lock of a BLOB larger than 4096 bytes
+  failed, on both ABIs.
+
+Fix: `venus/patches/gralloc-0002-gbm_mesa-import-1D-R8-buffers-with-their-allocated-shape.patch`
+(Intel wrapper, `src/minigbm-wrapper`). The wrapper's `gbm_import` and `gbm_map` reshape a
+`R8, height 1, width > 4096` request to `4096 x ceil(width / 4096)`, stride 4096, the shape
+it was allocated with.
+- The camera provider is 32-bit and loads the vendor's `/vendor/lib/libgbm_mesa_wrapper.so`
+  directly (the vtest shim is 64-bit only), so `src/minigbm-wrapper/build.sh` now also builds
+  an x86 wrapper (`out/lib/`), installed as `/vendor/lib/libgbm_mesa_wrapper.so`.
+- Test: AHardwareBuffer BLOBs of 64 KiB to 3.9 MB, allocate + CPU lock: all failed before,
+  all succeed now (64-bit and 32-bit).
 
 ## Tools
 

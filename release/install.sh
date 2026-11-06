@@ -79,6 +79,9 @@ install_system() {
     install -D -m644 "$D/android/vulkan.virtio.so" "$LIB/hw/vulkan.virtio.so"
     install -D -m644 "$D/android/libgbm_mesa_wrapper.so" "$LIB/libgbm_mesa_wrapper.so"
     install -D -m644 "$D/android/libgbm_mesa_wrapper_intel.so" "$LIB/libgbm_mesa_wrapper_intel.so"
+    # 32-bit processes (the camera provider) use the vendor wrapper directly; the patched one
+    # can map BLOB buffers (camera JPEG output)
+    install -D -m644 "$D/android/lib/libgbm_mesa_wrapper.so" /var/lib/waydroid/overlay/vendor/lib/libgbm_mesa_wrapper.so
     # composer: run it with libnativewindow preloaded so ANGLE's EGL image import works
     # there. The wrapper replaces the binary; the vendor.img one moves next to it as .real.
     BIN=/var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service

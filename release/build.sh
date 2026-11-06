@@ -20,6 +20,8 @@ cp "$ROOT/venus/hwc-yuv/build/hwcomposer.waydroid.so" "$D/android/"
 mkdir -p "$D/android/lib"
 cp "$ROOT/venus/mapper-yv12/build/lib64/android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.so" "$D/android/"
 cp "$ROOT/venus/mapper-yv12/build/lib/android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.so" "$D/android/lib/"
+# 32-bit Intel wrapper: 32-bit processes (camera provider) map BLOB buffers through it
+cp "$ROOT/src/minigbm-wrapper/out/lib/libgbm_mesa_wrapper.so" "$D/android/lib/libgbm_mesa_wrapper.so"
 
 cp "$VB/vtest/virgl_test_server" "$VB/server/virgl_render_server" "$D/host/bin/"
 # only the runtime soname link and the library (not the .so dev link or meson's .p dir)
