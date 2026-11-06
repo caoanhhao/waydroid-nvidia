@@ -27,6 +27,10 @@ uninstall_system() {
     waydroid session stop 2>/dev/null || true
     rm -f "$LIB/hw/vulkan.virtio.so" "$LIB/libgbm_mesa_wrapper.so" "$LIB/libgbm_mesa_wrapper_intel.so"
     rm -f "$LIB/hw/hwcomposer.waydroid.so" "$LIB/hw/hwcomposer.waydroid.real.so"
+    for dir in "$LIB/hw" /var/lib/waydroid/overlay/vendor/lib/hw; do
+        rm -f "$dir/android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.so" \
+              "$dir/android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.real.so"
+    done
     rm -f /var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service \
           /var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service.real
     for p in ro.hardware.vulkan mesa.vtest.socket.name gralloc.gbm.linear waydroid.gralloc.vtest \

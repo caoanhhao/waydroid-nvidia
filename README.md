@@ -76,11 +76,12 @@ Also needed: Android NDK r30, `meson`, `ninja`, `git`, and gcc on the host.
 | Gralloc shim | `src/minigbm-vtest/build-android.sh` | `src/minigbm-vtest` |
 | Intel LINEAR wrapper | `src/minigbm-wrapper/build.sh` | `src/minigbm-wrapper` |
 | hwcomposer format shim | `venus/hwc-yuv/build.sh` | `venus/hwc-yuv` |
+| gralloc4 mapper YV12 shim | `venus/mapper-yv12/build.sh` | `venus/mapper-yv12` |
 
 Build all parts:
 
 ```bash
-sh venus/build-venus-android.sh && sh venus/build-virglrenderer-host.sh && sh src/minigbm-vtest/build-android.sh && sh src/minigbm-wrapper/build.sh && sh venus/hwc-yuv/build.sh
+sh venus/build-venus-android.sh && sh venus/build-virglrenderer-host.sh && sh src/minigbm-vtest/build-android.sh && sh src/minigbm-wrapper/build.sh && sh venus/hwc-yuv/build.sh && sh venus/mapper-yv12/build.sh
 ```
 
 Collect the results into `release/dist/`. This also writes `VERSION` and `SHA256SUMS`.
@@ -251,7 +252,7 @@ configuration, from before any change, are in `backups/`.
   It does not overwrite `/usr/lib/virgl_render_server`.
 
 Fixed issues (the mouse cursor, video apps such as TikTok, the Play Store crash) are described
-in `release/README.md`.
+in `release/README.md`. The green camera preview is described in `venus/notes-camera.md`.
 
 ## Layout
 
@@ -262,6 +263,7 @@ in `release/README.md`.
 | `venus/patches/` | Patches for Mesa, virglrenderer and minigbm |
 | `venus/notes-*.md` | Diagnosis notes, one per issue |
 | `venus/hwc-yuv/` | hwcomposer format shim and the YV12 import test |
+| `venus/mapper-yv12/` | gralloc4 mapper shim for YV12 plane layouts and its test |
 | `venus/tests/` | Test programs for the host and inside Android |
 | `src/` | Patched sources (Mesa, virglrenderer, minigbm shim/wrapper) |
 | `fingerprint/` | Virtual fingerprint HAL (`hal/`), feature flag (`overlay/`), `install.sh`, `fp.sh` |

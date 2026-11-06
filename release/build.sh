@@ -2,7 +2,7 @@
 # Collect the built pieces into release/dist so install.sh needs nothing from src/.
 # Rebuild first if needed: venus/build-venus-android.sh, venus/build-virglrenderer-host.sh,
 # src/minigbm-vtest/build-android.sh, src/minigbm-wrapper/build.sh,
-# venus/hwc-yuv/build.sh.
+# venus/hwc-yuv/build.sh, venus/mapper-yv12/build.sh.
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 D=$ROOT/release/dist
@@ -16,6 +16,10 @@ cp "$ROOT/src/minigbm-vtest/build-android/libgbm_mesa_wrapper.so" "$D/android/li
 cp "$ROOT/src/minigbm-wrapper/out/libgbm_mesa_wrapper.so" "$D/android/libgbm_mesa_wrapper_intel.so"
 cp "$ROOT/venus/cursor/build/composer-preload-wrapper" "$D/android/"
 cp "$ROOT/venus/hwc-yuv/build/hwcomposer.waydroid.so" "$D/android/"
+# gralloc4 mapper shim, both ABIs (the camera provider is 32-bit)
+mkdir -p "$D/android/lib"
+cp "$ROOT/venus/mapper-yv12/build/lib64/android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.so" "$D/android/"
+cp "$ROOT/venus/mapper-yv12/build/lib/android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.so" "$D/android/lib/"
 
 cp "$VB/vtest/virgl_test_server" "$VB/server/virgl_render_server" "$D/host/bin/"
 # only the runtime soname link and the library (not the .so dev link or meson's .p dir)

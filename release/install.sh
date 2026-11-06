@@ -97,6 +97,20 @@ install_system() {
     [ -s "$LIB/hw/hwcomposer.waydroid.real.so" ] || { echo "cannot read hwcomposer from $IMG" >&2; exit 1; }
     chmod 644 "$LIB/hw/hwcomposer.waydroid.real.so"
     install -D -m644 "$D/android/hwcomposer.waydroid.so" "$LIB/hw/hwcomposer.waydroid.so"
+    # gralloc4 mapper: a shim gives single-plane YV12 buffers real Cr/Cb plane layouts, so
+    # CPU writers (camera, software codecs) put chroma where Mesa reads it (green camera
+    # preview otherwise). It loads the vendor.img mapper, copied next to it as .real.so.
+    # Both ABIs: the camera provider is a 32-bit process.
+    MAPPER=android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa
+    for abi in lib64:"$D/android" lib:"$D/android/lib"; do
+        dir=/var/lib/waydroid/overlay/vendor/${abi%%:*}/hw
+        mkdir -p "$dir"
+        rm -f "$dir/$MAPPER.real.so"
+        debugfs -R "dump /${abi%%:*}/hw/$MAPPER.so $dir/$MAPPER.real.so" "$IMG" 2>/dev/null
+        [ -s "$dir/$MAPPER.real.so" ] || { echo "cannot read /${abi%%:*}/hw/$MAPPER.so from $IMG" >&2; exit 1; }
+        chmod 644 "$dir/$MAPPER.real.so"
+        install -D -m644 "${abi#*:}/$MAPPER.so" "$dir/$MAPPER.so"
+    done
     sed -i 's/^mount_overlays = .*/mount_overlays = True/' "$CFG"
 
     # Vulkan: Venus over the vtest socket (host waydroid-vtest.service)
