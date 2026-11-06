@@ -31,7 +31,7 @@ cp -P "$VB"/src/libvirglrenderer.so.1 "$VB"/src/libvirglrenderer.so.1.*[0-9] "$D
     echo "built $(date -Iseconds)"
     echo "mesa         $(git -C "$ROOT/src/mesa" describe --always --dirty) ($(git -C "$ROOT/src/mesa" branch --show-current))"
     echo "virglrenderer $(git -C "$ROOT/src/virglrenderer" describe --always --dirty) ($(git -C "$ROOT/src/virglrenderer" branch --show-current))"
-    echo "minigbm-vtest $(git -C "$ROOT/src/minigbm-vtest" describe --always --dirty 2>/dev/null || echo '?')"
+    echo "repo         $(git -C "$ROOT" describe --always --dirty)"
 } >"$D/VERSION"
 (cd "$D" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum >SHA256SUMS)
 

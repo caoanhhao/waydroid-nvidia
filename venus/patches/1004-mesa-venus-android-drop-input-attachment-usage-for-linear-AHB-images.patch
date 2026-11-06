@@ -1,4 +1,4 @@
-From ba4f70247437f4723c9d40ac4c704e13f1494423 Mon Sep 17 00:00:00 2001
+From c5af4b222476d1fd2d660917d218a254197a9ed3 Mon Sep 17 00:00:00 2001
 From: caoanhhao <caoanhhao2@gmail.com>
 Date: Thu, 5 Nov 2026 13:26:59 +0700
 Subject: [PATCH] venus/android: drop input attachment usage for linear AHB

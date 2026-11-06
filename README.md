@@ -67,14 +67,18 @@ If `release/dist/` already has files (see `release/dist/VERSION`), two steps are
 
 ### Option 2: build from source
 
-Also needed: Android NDK r30, `meson`, `ninja`, `git`, and gcc on the host.
+Also needed: Android NDK r30 (in `/opt/android-ndk`, or set `NDK`), `meson`, `ninja`, `git`, gcc
+on the host, and an installed Waydroid image (the wrapper links against its vendor libraries).
+
+Upstream sources are not in this repository. On the first run each build script clones them into
+`src/` at a fixed version and applies the patches from `venus/patches/`:
 
 | Part | Script | Source |
 |---|---|---|
-| Venus for Android | `venus/build-venus-android.sh` | `src/mesa`, branch `venus-vtest` |
-| Host server | `venus/build-virglrenderer-host.sh` | `src/virglrenderer`, branch `vtest-dmabuf` |
-| Gralloc shim | `src/minigbm-vtest/build-android.sh` | `src/minigbm-vtest` |
-| Intel LINEAR wrapper | `src/minigbm-wrapper/build.sh` | `src/minigbm-wrapper` |
+| Venus for Android | `venus/build-venus-android.sh` | Mesa `mesa-26.2.6` + `0001`, `0002`, `1001`–`1004`, `1007`, `1008` → `src/mesa`, branch `venus-vtest` |
+| Host server | `venus/build-virglrenderer-host.sh` | virglrenderer `1.3.0` + `vrend-0001`, `vrend-0002` → `src/virglrenderer`, branch `vtest-dmabuf` |
+| Gralloc shim | `src/minigbm-vtest/build-android.sh` | `src/minigbm-vtest` (in this repo) |
+| Intel LINEAR wrapper (x86_64 + x86) | `src/minigbm-wrapper/build.sh` | waydroid minigbm `lineage-18.1` @ `e5a7769` + `gralloc-*` → `src/minigbm-wrapper/minigbm` |
 | hwcomposer format shim | `venus/hwc-yuv/build.sh` | `venus/hwc-yuv` |
 | gralloc4 mapper YV12 shim | `venus/mapper-yv12/build.sh` | `venus/mapper-yv12` |
 
@@ -90,8 +94,7 @@ Collect the results into `release/dist/`. This also writes `VERSION` and `SHA256
 sh release/build.sh
 ```
 
-Then install as in Option 1. The patches are in `venus/patches/` if you need to apply them to the
-upstream sources again.
+Then install as in Option 1.
 
 ## Daily use
 
@@ -265,7 +268,7 @@ in `release/README.md`. The green camera preview is described in `venus/notes-ca
 | `venus/hwc-yuv/` | hwcomposer format shim and the YV12 import test |
 | `venus/mapper-yv12/` | gralloc4 mapper shim for YV12 plane layouts and its test |
 | `venus/tests/` | Test programs for the host and inside Android |
-| `src/` | Patched sources (Mesa, virglrenderer, minigbm shim/wrapper) |
+| `src/` | Own code: gralloc shim (`minigbm-vtest`), Intel wrapper build (`minigbm-wrapper`); the build scripts clone the upstream sources here |
 | `fingerprint/` | Virtual fingerprint HAL (`hal/`), feature flag (`overlay/`), `install.sh`, `fp.sh` |
 | `plan.md` | Project plan |
 | `backups/` | Original Waydroid configuration |

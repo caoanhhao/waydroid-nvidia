@@ -1,4 +1,6 @@
+From 22ffaea39b63f72010ffdc5b474e22e8a9be580c Mon Sep 17 00:00:00 2001
 From: caoanhhao <caoanhhao2@gmail.com>
+Date: Thu, 5 Nov 2026 19:56:31 +0700
 Subject: [PATCH] venus: emulate ASTC LDR when the renderer lacks it
 
 Desktop NVIDIA exposes no ASTC (or ETC2) in Vulkan, while Android games

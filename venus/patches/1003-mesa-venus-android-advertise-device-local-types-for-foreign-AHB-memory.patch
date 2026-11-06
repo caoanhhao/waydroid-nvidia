@@ -1,4 +1,4 @@
-From 6cacc6bf173c6aa51aca5f5532f3b29a983efea7 Mon Sep 17 00:00:00 2001
+From f6de15b042a9fc16159c841c8ed58fbbd144015e Mon Sep 17 00:00:00 2001
 From: caoanhhao <caoanhhao2@gmail.com>
 Date: Thu, 5 Nov 2026 12:59:54 +0700
 Subject: [PATCH] venus/android: advertise device-local types for foreign AHB

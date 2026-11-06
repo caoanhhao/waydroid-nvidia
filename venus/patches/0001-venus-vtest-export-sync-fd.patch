@@ -1,3 +1,13 @@
+From c6b87a0767c5801f204c6cfdeed31b06196b475c Mon Sep 17 00:00:00 2001
+From: caoanhhao <dev@skyperry.com>
+Date: Thu, 5 Nov 2026 11:35:28 +0700
+Subject: [PATCH] venus/vtest: export sync fds via CPU wait (patch 0001)
+
+caoanhhao used AI to code
+---
+ src/virtio/vulkan/vn_renderer_vtest.c | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
 diff --git a/src/virtio/vulkan/vn_renderer_vtest.c b/src/virtio/vulkan/vn_renderer_vtest.c
 index fc59d32..6b8d3e6 100644
 --- a/src/virtio/vulkan/vn_renderer_vtest.c
@@ -48,3 +58,6 @@ index fc59d32..6b8d3e6 100644
     vtest->base.sync_ops.reset = vtest_sync_reset;
     vtest->base.sync_ops.read = vtest_sync_read;
     vtest->base.sync_ops.write = vtest_sync_write;
+-- 
+2.56.0
+

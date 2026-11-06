@@ -18,7 +18,7 @@ BUILD=$SRC/build
 if [ ! -d "$SRC" ]; then
     git clone --branch 1.3.0 https://gitlab.freedesktop.org/virgl/virglrenderer.git "$SRC"
     git -C "$SRC" switch -c vtest-dmabuf
-    git -C "$SRC" am "$ROOT"/venus/patches/vrend-*.patch
+    git -C "$SRC" am "$ROOT"/venus/patches/vrend-0001-*.patch "$ROOT"/venus/patches/vrend-0002-*.patch
 fi
 
 if [ ! -f "$BUILD/build.ninja" ]; then

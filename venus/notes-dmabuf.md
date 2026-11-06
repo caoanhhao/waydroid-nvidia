@@ -146,7 +146,7 @@ allocations on the 4070, handed to Android as dma-bufs.
 | What | Where |
 |------|-------|
 | Server patch | `patches/vrend-0002-vtest-add-VCMD_ALLOC_DMABUF_IMAGE-protocol-version-6.patch` (on top of vrend-0001; `src/virglrenderer` branch `vtest-dmabuf`) |
-| gralloc shim | `patches/minigbm-vtest-0001-gralloc-shim-allocating-window-buffers-through-vtest.patch` = `src/minigbm-vtest` (own git repo), NDK build `src/minigbm-vtest/build-android.sh` |
+| gralloc shim | `src/minigbm-vtest` (tracked in this repo; it was patch minigbm-vtest-0001), NDK build `src/minigbm-vtest/build-android.sh` |
 | Deploy (user, sudo) | `deploy-gralloc-vtest.sh install \| enable \| disable \| uninstall \| status` |
 | Host test | `tests/vtest-hostalloc.c`, `tests/fake-inner-wrapper.c`, `tests/run-hostalloc-test.sh [w h]` |
 
