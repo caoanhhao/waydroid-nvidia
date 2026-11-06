@@ -255,5 +255,5 @@ in `release/README.md`.
 | `venus/tests/` | Test programs for the host and inside Android |
 | `src/` | Patched sources (Mesa, virglrenderer, minigbm shim/wrapper) |
 | `fingerprint/` | Virtual fingerprint HAL (`hal/`), feature flag (`overlay/`), `install.sh`, `fp.sh` |
-| `HANDOFF.md`, `plan.md` | Project history and plan |
+| `plan.md` | Project plan |
 | `backups/` | Original Waydroid configuration |

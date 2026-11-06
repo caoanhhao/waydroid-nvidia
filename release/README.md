@@ -122,4 +122,4 @@ Vulkan has no ASTC, so every texture failed to load. Venus now emulates ASTC LDR
 get ASTC through ANGLE as well. `VN_DEBUG=no_astc_emu` turns it off. Rebuild with
 `build.sh` to pick it up. Details: `venus/notes-deltaforce.md`.
 
-Details: `venus/notes-dmabuf.md`, `HANDOFF.md`, patches in `venus/patches/`.
+Details: `venus/notes-dmabuf.md`, patches in `venus/patches/`.

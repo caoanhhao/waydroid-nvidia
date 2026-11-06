@@ -70,7 +70,7 @@ diff -ru a/release/README.md b/release/README.md
 +
 +Details: `venus/notes-tiktok.md`.
 +
- Details: `venus/notes-dmabuf.md`, `HANDOFF.md`, patches in `venus/patches/`.
+ Details: `venus/notes-dmabuf.md`, patches in `venus/patches/`.
 diff -ru a/release/uninstall.sh b/release/uninstall.sh
 --- a/release/uninstall.sh	2026-11-05 17:04:26.309240286 +0700
 +++ b/release/uninstall.sh	2026-11-05 17:05:04.806328422 +0700
