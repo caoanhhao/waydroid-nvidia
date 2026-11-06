@@ -15,3 +15,5 @@
 /venus/cursor/build/
 # logs and measurement output
 *.txt
+# image backups
+/backups/*.img*
