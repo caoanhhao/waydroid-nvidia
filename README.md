@@ -132,6 +132,53 @@ Expected output: `Pipeline=Skia (Vulkan)`.
 nvidia-smi | grep virgl
 ```
 
+## Fingerprint via adb
+
+Optional: a fake under-display fingerprint sensor that you drive from adb. It is AOSP's virtual
+fingerprint HAL (`fingerprint/hal/SOURCE.md`); the sensor is a spot on the screen, and a "finger"
+is a long press on that spot.
+
+1. Install (stops Waydroid), then start Waydroid again:
+
+   ```bash
+   sudo sh fingerprint/install.sh
+   ```
+
+2. Android needs a screen lock before it allows fingerprints. If there is none, set one in
+   Settings > Security, or:
+
+   ```bash
+   adb shell locksettings set-pin 1234
+   ```
+
+3. Enroll a finger. This opens Settings and goes through its screens for you; enter the PIN in
+   the Waydroid window when asked, or pass it as `FP_PIN`:
+
+   ```bash
+   FP_PIN=1234 sh fingerprint/fp.sh enroll
+   ```
+
+4. Lock the screen, then touch the sensor with an enrolled finger (unlocks), with an unknown one
+   (rejected), or force a lockout:
+
+   ```bash
+   sh fingerprint/fp.sh touch
+   ```
+
+   ```bash
+   sh fingerprint/fp.sh bad
+   ```
+
+   ```bash
+   sh fingerprint/fp.sh lockout
+   ```
+
+`sh fingerprint/fp.sh status` shows the enrolled fingers and the sensor state. The script connects
+adb to the container itself (or uses `$ANDROID_SERIAL`). Like on a phone, the PIN is needed once
+after every Android start before a fingerprint can unlock, and after a lockout. The sensor sits at
+`180:560` (x:y in display pixels); for another spot run `sh fingerprint/fp.sh place`, then restart
+Waydroid. Remove everything with `sudo sh fingerprint/uninstall.sh`.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -207,5 +254,6 @@ in `release/README.md`.
 | `venus/hwc-yuv/` | hwcomposer format shim and the YV12 import test |
 | `venus/tests/` | Test programs for the host and inside Android |
 | `src/` | Patched sources (Mesa, virglrenderer, minigbm shim/wrapper) |
+| `fingerprint/` | Virtual fingerprint HAL (`hal/`), feature flag (`overlay/`), `install.sh`, `fp.sh` |
 | `HANDOFF.md`, `plan.md` | Project history and plan |
 | `backups/` | Original Waydroid configuration |

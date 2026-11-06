@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SystemServer starts FingerprintService only when this feature is declared.
+     The service then finds the HAL through the VINTF fragment (IFingerprint/virtual). -->
+<permissions>
+    <feature name="android.hardware.fingerprint" />
+</permissions>
