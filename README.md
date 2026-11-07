@@ -188,10 +188,32 @@ is a long press on that spot.
 
 `sh fingerprint/fp.sh status` shows the enrolled fingers and the sensor state. The script connects
 adb to the container itself (or uses `$ANDROID_SERIAL`). Like on a phone, the PIN is needed once
-after every Android start before a fingerprint can unlock, and after a lockout or Lockdown; `touch`
-says which one applies. The sensor sits at
+after every Android start before a fingerprint can unlock (see the option below), and after a
+lockout or Lockdown; `touch` says which one applies. The sensor sits at
 `180:560` (x:y in display pixels); for another spot run `sh fingerprint/fp.sh place`, then restart
 Waydroid. Remove everything with `sudo sh fingerprint/uninstall.sh`.
+
+### Optional: unlock without the PIN after Android starts
+
+For automation that cannot type the PIN, an overlay turns off `config_strongAuthRequiredOnBoot`,
+so `fp.sh touch` unlocks right after Android starts. After that, anyone with adb can unlock
+Android. Apps that keep keys locked until the PIN is entered still wait for it, and a lockout or
+Lockdown still asks for the PIN.
+
+Install (stops Waydroid), then start Waydroid again:
+
+```bash
+sudo sh fingerprint/boot-unlock/install.sh
+```
+
+Remove it (`fingerprint/uninstall.sh` removes it too):
+
+```bash
+sudo sh fingerprint/boot-unlock/uninstall.sh
+```
+
+The APK is prebuilt in `fingerprint/boot-unlock/`; `sh fingerprint/boot-unlock/build.sh` rebuilds
+it from the source there (needs Android build-tools and a running Waydroid).
 
 ## Troubleshooting
 
@@ -269,6 +291,6 @@ in `release/README.md`. The green camera preview is described in `venus/notes-ca
 | `venus/mapper-yv12/` | gralloc4 mapper shim for YV12 plane layouts and its test |
 | `venus/tests/` | Test programs for the host and inside Android |
 | `src/` | Own code: gralloc shim (`minigbm-vtest`), Intel wrapper build (`minigbm-wrapper`); the build scripts clone the upstream sources here |
-| `fingerprint/` | Virtual fingerprint HAL (`hal/`), feature flag (`overlay/`), `install.sh`, `fp.sh` |
+| `fingerprint/` | Virtual fingerprint HAL (`hal/`), feature flag (`overlay/`), optional boot unlock (`boot-unlock/`), `install.sh`, `fp.sh` |
 | `plan.md` | Project plan |
 | `backups/` | Original Waydroid configuration |

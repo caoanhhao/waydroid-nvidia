@@ -1,5 +1,6 @@
 #!/bin/sh
-# Remove what fingerprint/install.sh put into the Waydroid vendor overlay.
+# Remove what fingerprint/install.sh (and boot-unlock/install.sh) put into the Waydroid
+# vendor overlay.
 #
 #   sudo sh fingerprint/uninstall.sh
 #
@@ -14,7 +15,8 @@ VENDOR=/var/lib/waydroid/overlay/vendor
 waydroid session stop 2>/dev/null || true
 for f in bin/hw/android.hardware.biometrics.fingerprint-service.example \
     $(cd "$FP/hal" && ls lib64/*.so etc/init/*.rc etc/vintf/manifest/*.xml) \
-    $(cd "$FP/overlay" && find . -type f | sed 's|^\./||'); do
+    $(cd "$FP/overlay" && find . -type f | sed 's|^\./||') \
+    overlay/FingerprintBootUnlock.apk; do # boot-unlock/install.sh, if it was used
     rm -fv "$VENDOR/$f"
 done
 CFG=/var/lib/waydroid/waydroid.cfg
@@ -23,7 +25,7 @@ for p in type udfps.control_illumination sensor_location; do
 done
 waydroid upgrade --offline
 # drop the directories only these files used, if now empty
-for d in etc/vintf/manifest etc/vintf etc/permissions; do
+for d in etc/vintf/manifest etc/vintf etc/permissions overlay; do
     rmdir "$VENDOR/$d" 2>/dev/null || true
 done
 systemctl restart waydroid-container
