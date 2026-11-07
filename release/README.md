@@ -122,4 +122,10 @@ Vulkan has no ASTC, so every texture failed to load. Venus now emulates ASTC LDR
 get ASTC through ANGLE as well. `VN_DEBUG=no_astc_emu` turns it off. Rebuild with
 `build.sh` to pick it up. Details: `venus/notes-deltaforce.md`.
 
+Fixed: Waydroid could stay on the boot animation after boot. When the host render server
+dropped bootanimation's Vulkan context (a CS error during boot), Venus waited forever in
+`vkQueuePresentKHR` for a fence that never signals, and the frozen boot animation stayed on
+top of the UI. The wait is now capped at 5 s (Mesa patch 1009). After that the process aborts
+on its dead context and the UI shows. Rebuild with `build.sh` to pick it up.
+
 Details: `venus/notes-dmabuf.md`, patches in `venus/patches/`.
