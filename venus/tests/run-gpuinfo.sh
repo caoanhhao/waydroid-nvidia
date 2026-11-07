@@ -1,5 +1,6 @@
 #!/bin/sh
-# Print the GPU (Vulkan devices, GLES context) each ABI sees inside Waydroid: x86_64, x86,
+# Print the GPU (Vulkan devices, GLES context) each ABI sees inside Waydroid, and draw with
+# the ES 3.2 stages (android-gles32-test.c): x86_64, x86,
 # and arm64-v8a / armeabi-v7a through the native bridge. Needs the NDK and adb connected
 # (Waydroid window open).
 #
@@ -17,7 +18,10 @@ for t in x86_64:x86_64-linux-android33 x86:i686-linux-android33 \
     abi=${t%%:*}
     "$TC/${t#*:}-clang" -O1 -Wall -o "$B/gpuinfo-$abi" "$ROOT/venus/tests/android-gpuinfo.c" \
         -lvulkan -lEGL -lGLESv2 -ldl
-    adb push -q "$B/gpuinfo-$abi" /data/local/tmp/
-    adb shell chmod 755 "/data/local/tmp/gpuinfo-$abi"
+    "$TC/${t#*:}-clang" -O1 -Wall -o "$B/gles32-test-$abi" "$ROOT/venus/tests/android-gles32-test.c" \
+        -lEGL -lGLESv3
+    adb push -q "$B/gpuinfo-$abi" "$B/gles32-test-$abi" /data/local/tmp/
+    adb shell chmod 755 "/data/local/tmp/gpuinfo-$abi" "/data/local/tmp/gles32-test-$abi"
     adb shell "/data/local/tmp/gpuinfo-$abi" 2>&1 || echo "gpuinfo-$abi failed ($?)"
+    adb shell "/data/local/tmp/gles32-test-$abi" 2>&1 || echo "gles32-test-$abi failed ($?)"
 done

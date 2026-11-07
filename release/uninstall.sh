@@ -39,7 +39,8 @@ uninstall_system() {
           /var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service.real
     for p in ro.hardware.vulkan mesa.vtest.socket.name gralloc.gbm.linear waydroid.gralloc.vtest \
              debug.hwui.renderer persist.waydroid.cursor_force_shm mesa.vn.debug ro.logd.size \
-             debug.renderengine.backend debug.mesa.log.level ro.hardware.egl ro.opengles.version; do
+             debug.renderengine.backend debug.mesa.log.level ro.hardware.egl ro.opengles.version \
+             debug.angle.feature_overrides_enabled; do
         del_prop "$p"
     done
     sed -i "/^\[properties\]/a ro.hardware.egl = mesa" "$CFG"

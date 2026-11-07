@@ -26,11 +26,15 @@ bridge (Venus is built for both 64-bit and 32-bit). Apps see it as the device's 
 | What apps see | Value |
 |---|---|
 | Vulkan device | `NVIDIA GeForce RTX 4070`, vendor `0x10de`, Vulkan 1.3 (driver `venus`) |
-| OpenGL ES | 3.1 through ANGLE (`GL_RENDERER` = `ANGLE (NVIDIA, Vulkan 1.3.351 (NVIDIA NVIDIA GeForce RTX 4070 …))`) |
-| Declared features | `android.hardware.vulkan.version` 1.3, `reqGlEsVersion` 3.1, no `opengles.aep` |
+| OpenGL ES | 3.2 + Android Extension Pack through ANGLE (`GL_RENDERER` = `ANGLE (NVIDIA, Vulkan 1.3.351 (NVIDIA NVIDIA GeForce RTX 4070 …))`) |
+| Declared features | `android.hardware.vulkan.version` 1.3, `reqGlEsVersion` 3.2, `opengles.aep` |
 
-ANGLE in Android 13 only conforms up to ES 3.1, so the system declares 3.1 instead of Waydroid's
-default 3.2. Check what each ABI sees with `sh venus/tests/run-gpuinfo.sh`.
+ANGLE in Android 13 stops at ES 3.1 on its own: it exposes 3.2 only with
+`debug.angle.feature_overrides_enabled=exposeNonConformantExtensionsAndVersions` (set by
+`install.sh`), because its 3.2 had not passed conformance yet. Venus has every Vulkan feature 3.2
+needs, and the override adds nothing but ES 3.2 and its extensions (geometry and tessellation
+shaders, texture buffers, `GL_ANDROID_extension_pack_es31a`). `sh venus/tests/run-gpuinfo.sh`
+prints what each ABI sees and draws with each of those stages.
 
 ## Requirements
 
