@@ -116,3 +116,23 @@ there:
 
 The ASTC emulation (patch 1008) is still worth keeping: it fixes the launch
 crash and benefits other ASTC-only games and GLES apps.
+
+## 2026-11-07 recheck: "the game disappears after 45 s"
+
+With the drivers up to dd3c9a4 (overlay `vulkan.virtio.so` of 2026-11-07,
+`persist.waydroid.fake_touch=com.garena.game.df`):
+
+- No crash: no tombstone, no host coredump, no vtest errors, no
+  `is unknown [raw type]` textures. The game reaches the Login stage and ticks at
+  about 25 fps.
+- Left alone, it stays on the Login screen (tested for more than 4 minutes).
+- The disappearing process came from a login press:
+  `[LoginInterface][OnThirdPartLoginBtnClick] channel: 10`, then
+  `GetClientType emulatorName:TencentAoYYB` → `is simulator`. That opens the
+  "For fair play, avoid using emulators" window, followed by INTL `AuthLogout` and
+  `System.exit called, status: 0` (logcat: "exited cleanly (0)"). This is the
+  game's emulator check. It is not bypassed here (see above).
+- `adb exec-out screencap` showed the lower half black with a moving dither
+  edge, but the real window (`grim` on the Waydroid window geometry) shows the
+  full Login screen with all buttons. The artifact exists only in the screencap
+  path, not on the display. Use `grim`/hypruse to check Delta Force visually.
