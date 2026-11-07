@@ -31,6 +31,8 @@ uninstall_system() {
     rm -f /var/lib/waydroid/overlay/vendor/etc/permissions/android.hardware.vulkan.version.xml \
           /var/lib/waydroid/overlay/vendor/etc/permissions/android.hardware.opengles.aep.xml
     rm -f "$LIB/hw/hwcomposer.waydroid.so" "$LIB/hw/hwcomposer.waydroid.real.so"
+    rm -f "$LIB"/egl/lib*_gpuid.so /var/lib/waydroid/overlay/vendor/lib/egl/lib*_gpuid.so \
+          /var/lib/waydroid/overlay/vendor/etc/gpuid.conf
     for dir in "$LIB/hw" /var/lib/waydroid/overlay/vendor/lib/hw; do
         rm -f "$dir/android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.so" \
               "$dir/android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.real.so"

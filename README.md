@@ -36,6 +36,13 @@ needs, and the override adds nothing but ES 3.2 and its extensions (geometry and
 shaders, texture buffers, `GL_ANDROID_extension_pack_es31a`). `sh venus/tests/run-gpuinfo.sh`
 prints what each ABI sees and draws with each of those stages.
 
+Some games pick their graphics API from a whitelist of GPU names read from `GL_RENDERER`. Genshin
+Impact, for example, turns on Vulkan only for Adreno, Mali and Xclipse GPUs. The GLES driver is
+therefore `gpuid` (`venus/gpuid/`), a shim that is ANGLE for everything but `glGetString`. It
+gives the apps listed in `/vendor/etc/gpuid.conf` (`venus/gpuid/gpuid.conf`) another
+`GL_VENDOR`/`GL_RENDERER`, and every other process sees ANGLE's own strings. Rendering stays on
+Venus and NVIDIA either way: with the shim, Genshin Impact runs on Vulkan 1.3 on the RTX 4070.
+
 ## Requirements
 
 | Component | Tested with |
@@ -101,11 +108,12 @@ Upstream sources are not in this repository. On the first run each build script 
 | Intel LINEAR wrapper (x86_64 + x86) | `src/minigbm-wrapper/build.sh` | waydroid minigbm `lineage-18.1` @ `e5a7769` + `gralloc-*` → `src/minigbm-wrapper/minigbm` |
 | hwcomposer format shim | `venus/hwc-yuv/build.sh` | `venus/hwc-yuv` |
 | gralloc4 mapper YV12 shim | `venus/mapper-yv12/build.sh` | `venus/mapper-yv12` |
+| GLES GPU-name shim (`gpuid`) | `venus/gpuid/build.sh` (needs Waydroid running: it pulls the ANGLE libraries with adb) | `venus/gpuid` |
 
 Build all parts:
 
 ```bash
-sh venus/build-venus-android.sh && sh venus/build-virglrenderer-host.sh && sh src/minigbm-vtest/build-android.sh && sh src/minigbm-wrapper/build.sh && sh venus/hwc-yuv/build.sh && sh venus/mapper-yv12/build.sh
+sh venus/build-venus-android.sh && sh venus/build-virglrenderer-host.sh && sh src/minigbm-vtest/build-android.sh && sh src/minigbm-wrapper/build.sh && sh venus/hwc-yuv/build.sh && sh venus/mapper-yv12/build.sh && sh venus/gpuid/build.sh
 ```
 
 Collect the results into `release/dist/`. This also writes `VERSION` and `SHA256SUMS`.
@@ -309,6 +317,7 @@ in `release/README.md`. The green camera preview is described in `venus/notes-ca
 | `venus/notes-*.md` | Diagnosis notes, one per issue |
 | `venus/hwc-yuv/` | hwcomposer format shim and the YV12 import test |
 | `venus/mapper-yv12/` | gralloc4 mapper shim for YV12 plane layouts and its test |
+| `venus/gpuid/` | GLES shim over ANGLE that renames the GPU for chosen apps (`gpuid.conf`) |
 | `venus/tests/` | Test programs for the host and inside Android |
 | `src/` | Own code: gralloc shim (`minigbm-vtest`), Intel wrapper build (`minigbm-wrapper`); the build scripts clone the upstream sources here |
 | `fingerprint/` | Virtual fingerprint HAL (`hal/`), feature flag (`overlay/`), optional boot unlock (`boot-unlock/`), `install.sh`, `fp.sh` |

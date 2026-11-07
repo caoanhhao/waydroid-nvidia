@@ -13,6 +13,7 @@
 /venus/hwc-yuv/out/
 /venus/mapper-yv12/build/
 /venus/cursor/build/
+/venus/gpuid/build/
 # logs and measurement output
 *.txt
 # image backups

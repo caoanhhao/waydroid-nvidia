@@ -132,13 +132,22 @@ EOF
         chmod 644 "$dir/$MAPPER.real.so"
         install -D -m644 "${abi#*:}/$MAPPER.so" "$dir/$MAPPER.so"
     done
+    # GLES driver: the gpuid shim, which is ANGLE except that the apps in gpuid.conf read
+    # a GL_RENDERER their GPU whitelist knows (Genshin Impact only turns on Vulkan for
+    # Adreno/Mali/Xclipse names; it renders on Venus/NVIDIA either way)
+    for abi in lib64:"$D/android/egl" lib:"$D/android/lib/egl"; do
+        mkdir -p "/var/lib/waydroid/overlay/vendor/${abi%%:*}/egl"
+        install -m644 "${abi#*:}"/lib*_gpuid.so "/var/lib/waydroid/overlay/vendor/${abi%%:*}/egl/"
+    done
+    install -D -m644 "$D/android/gpuid.conf" /var/lib/waydroid/overlay/vendor/etc/gpuid.conf
     sed -i 's/^mount_overlays = .*/mount_overlays = True/' "$CFG"
 
     # Vulkan: Venus over the vtest socket (host waydroid-vtest.service)
     set_prop ro.hardware.vulkan virtio
     set_prop mesa.vtest.socket.name /data/vtest/vtest.sock
-    # all GLES through ANGLE on Venus: Intel must never render into NVIDIA buffers
-    set_prop ro.hardware.egl angle
+    # all GLES through ANGLE on Venus (via the gpuid shim above): Intel must never render
+    # into NVIDIA buffers
+    set_prop ro.hardware.egl gpuid
     # GLES 3.2 + AEP: ANGLE in Android 13 stops at 3.1 unless told to expose versions it
     # has not passed conformance for, although Venus has every feature they need. The
     # override only adds ES 3.2 and its extensions (geometry/tessellation shaders, texture
