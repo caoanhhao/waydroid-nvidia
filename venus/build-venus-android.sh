@@ -13,7 +13,7 @@ if [ ! -d "$ROOT/src/mesa" ]; then
   git -C "$ROOT/src/mesa" switch -c venus-vtest
   git -C "$ROOT/src/mesa" am "$P"/0001-*.patch "$P"/0002-*.patch "$P"/1001-*.patch \
     "$P"/1002-*.patch "$P"/1003-*.patch "$P"/1004-*.patch "$P"/1007-*.patch "$P"/1008-*.patch \
-    "$P"/1009-*.patch "$P"/1010-*.patch
+    "$P"/1009-*.patch "$P"/1010-*.patch "$P"/1011-*.patch
 fi
 cd "$ROOT/src/mesa"
 
