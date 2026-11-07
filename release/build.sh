@@ -13,6 +13,9 @@ mkdir -p "$D/android" "$D/host/bin" "$D/host/lib"
 
 cp "$ROOT/src/mesa/build-android/src/virtio/vulkan/libvulkan_virtio.so" "$D/android/vulkan.virtio.so"
 cp "$ROOT/src/minigbm-vtest/build-android/libgbm_mesa_wrapper.so" "$D/android/libgbm_mesa_wrapper.so"
+# 32-bit Venus: x86 processes and armeabi-v7a apps (native bridge) load vendor/lib/hw
+mkdir -p "$D/android/lib"
+cp "$ROOT/src/mesa/build-android-x86/src/virtio/vulkan/libvulkan_virtio.so" "$D/android/lib/vulkan.virtio.so"
 cp "$ROOT/src/minigbm-wrapper/out/libgbm_mesa_wrapper.so" "$D/android/libgbm_mesa_wrapper_intel.so"
 cp "$ROOT/venus/cursor/build/composer-preload-wrapper" "$D/android/"
 cp "$ROOT/venus/hwc-yuv/build/hwcomposer.waydroid.so" "$D/android/"

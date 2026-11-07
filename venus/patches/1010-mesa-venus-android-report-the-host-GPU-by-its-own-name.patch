@@ -1,0 +1,46 @@
+From 4830ea2c2d3d592946ba59ce18c7bb8d10b476e4 Mon Sep 17 00:00:00 2001
+From: caoanhhao <caoanhhao2@gmail.com>
+Date: Sat, 7 Nov 2026 14:28:32 +0700
+Subject: [PATCH] venus/android: report the host GPU by its own name
+
+On Android Venus is the device's only GPU. Report the host device name
+(e.g. "NVIDIA GeForce RTX 4070") the way a native driver does instead of
+"Virtio-GPU Venus (...)"; driverID and driverName still say Venus.
+
+caoanhhao used AI to code
+---
+ src/virtio/vulkan/vn_physical_device.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index 9b1001a..a82fe3a 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -13,6 +13,7 @@
+ #include <stdio.h>
+ 
+ #include "git_sha1.h"
++#include "util/detect_os.h"
+ #include "util/mesa-blake3.h"
+ #include "util/os_misc.h"
+ #include "venus-protocol/vn_protocol_driver_device.h"
+@@ -562,8 +563,16 @@ vn_physical_device_sanitize_properties(struct vn_physical_device *physical_dev)
+    physical_dev->wa_min_fb_align = strstr(props->deviceName, "JSL") ? 128 : 1;
+ 
+    char device_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
++#if DETECT_OS_ANDROID
++   /* On Android Venus is the device's only GPU: report the host GPU by its own name, like
++    * a native driver does. driverID/driverName still say Venus.
++    */
++   int device_name_len = snprintf(device_name, sizeof(device_name), "%s",
++                                  props->deviceName);
++#else
+    int device_name_len = snprintf(device_name, sizeof(device_name),
+                                   "Virtio-GPU Venus (%s)", props->deviceName);
++#endif
+    if (device_name_len >= VK_MAX_PHYSICAL_DEVICE_NAME_SIZE) {
+       memcpy(device_name + VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 5, "...)", 4);
+       device_name_len = VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1;
+-- 
+2.56.0
+

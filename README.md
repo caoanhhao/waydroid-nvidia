@@ -20,6 +20,18 @@ NVIDIA Vulkan (nvidia-open) → RTX 4070 → Hyprland
 Window buffers are allocated by NVIDIA on the host (block-linear format) and passed into Android
 through vtest. Hyprland shows them directly, without a copy.
 
+Every app ABI gets the GPU: x86_64 and x86 natively, arm64-v8a and armeabi-v7a through the native
+bridge (Venus is built for both 64-bit and 32-bit). Apps see it as the device's own GPU:
+
+| What apps see | Value |
+|---|---|
+| Vulkan device | `NVIDIA GeForce RTX 4070`, vendor `0x10de`, Vulkan 1.3 (driver `venus`) |
+| OpenGL ES | 3.1 through ANGLE (`GL_RENDERER` = `ANGLE (NVIDIA, Vulkan 1.3.351 (NVIDIA NVIDIA GeForce RTX 4070 …))`) |
+| Declared features | `android.hardware.vulkan.version` 1.3, `reqGlEsVersion` 3.1, no `opengles.aep` |
+
+ANGLE in Android 13 only conforms up to ES 3.1, so the system declares 3.1 instead of Waydroid's
+default 3.2. Check what each ABI sees with `sh venus/tests/run-gpuinfo.sh`.
+
 ## Requirements
 
 | Component | Tested with |
@@ -79,7 +91,7 @@ Upstream sources are not in this repository. On the first run each build script 
 
 | Part | Script | Source |
 |---|---|---|
-| Venus for Android | `venus/build-venus-android.sh` | Mesa `mesa-26.2.6` + `0001`, `0002`, `1001`–`1004`, `1007`–`1009` → `src/mesa`, branch `venus-vtest` |
+| Venus for Android | `venus/build-venus-android.sh` | Mesa `mesa-26.2.6` + `0001`, `0002`, `1001`–`1004`, `1007`–`1010` → `src/mesa`, branch `venus-vtest` |
 | Host server | `venus/build-virglrenderer-host.sh` | virglrenderer `1.3.0` + `vrend-0001`, `vrend-0002` → `src/virglrenderer`, branch `vtest-dmabuf` |
 | Gralloc shim | `src/minigbm-vtest/build-android.sh` | `src/minigbm-vtest` (in this repo) |
 | Intel LINEAR wrapper (x86_64 + x86) | `src/minigbm-wrapper/build.sh` | waydroid minigbm `lineage-18.1` @ `e5a7769` + `gralloc-*` → `src/minigbm-wrapper/minigbm` |

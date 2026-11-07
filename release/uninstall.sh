@@ -27,6 +27,9 @@ uninstall_system() {
     waydroid session stop 2>/dev/null || true
     rm -f "$LIB/hw/vulkan.virtio.so" "$LIB/libgbm_mesa_wrapper.so" "$LIB/libgbm_mesa_wrapper_intel.so"
     rm -f /var/lib/waydroid/overlay/vendor/lib/libgbm_mesa_wrapper.so
+    rm -f /var/lib/waydroid/overlay/vendor/lib/hw/vulkan.virtio.so
+    rm -f /var/lib/waydroid/overlay/vendor/etc/permissions/android.hardware.vulkan.version.xml \
+          /var/lib/waydroid/overlay/vendor/etc/permissions/android.hardware.opengles.aep.xml
     rm -f "$LIB/hw/hwcomposer.waydroid.so" "$LIB/hw/hwcomposer.waydroid.real.so"
     for dir in "$LIB/hw" /var/lib/waydroid/overlay/vendor/lib/hw; do
         rm -f "$dir/android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.so" \
@@ -36,7 +39,7 @@ uninstall_system() {
           /var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service.real
     for p in ro.hardware.vulkan mesa.vtest.socket.name gralloc.gbm.linear waydroid.gralloc.vtest \
              debug.hwui.renderer persist.waydroid.cursor_force_shm mesa.vn.debug ro.logd.size \
-             debug.renderengine.backend debug.mesa.log.level ro.hardware.egl; do
+             debug.renderengine.backend debug.mesa.log.level ro.hardware.egl ro.opengles.version; do
         del_prop "$p"
     done
     sed -i "/^\[properties\]/a ro.hardware.egl = mesa" "$CFG"

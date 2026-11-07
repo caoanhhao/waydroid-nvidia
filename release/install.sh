@@ -77,6 +77,28 @@ install_system() {
     echo "=== Android: overlay + props"
     waydroid session stop 2>/dev/null || true
     install -D -m644 "$D/android/vulkan.virtio.so" "$LIB/hw/vulkan.virtio.so"
+    # 32-bit processes (x86, and armeabi-v7a apps through the native bridge) load
+    # vendor/lib/hw; vendor.img's own 32-bit Venus cannot reach the vtest socket, so they
+    # had no GPU at all
+    install -D -m644 "$D/android/lib/vulkan.virtio.so" /var/lib/waydroid/overlay/vendor/lib/hw/vulkan.virtio.so
+    # declare what the GPU really offers (CTS checks both against the driver):
+    # Vulkan 1.3 (Venus on NVIDIA), and GLES 3.1 without the Android Extension Pack, the
+    # most ANGLE conforms to (it lacks geometry/tessellation shaders, texture buffers)
+    PERM=/var/lib/waydroid/overlay/vendor/etc/permissions
+    mkdir -p "$PERM"
+    cat >"$PERM/android.hardware.vulkan.version.xml" <<'EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Vulkan 1.3 (0x403000): the API version Venus reports for the NVIDIA GPU -->
+<permissions>
+    <feature name="android.hardware.vulkan.version" version="4206592" />
+</permissions>
+EOF
+    cat >"$PERM/android.hardware.opengles.aep.xml" <<'EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<!-- no Android Extension Pack: ANGLE's GLES 3.1 lacks geometry/tessellation shaders -->
+<permissions />
+EOF
+    chmod 644 "$PERM/android.hardware.vulkan.version.xml" "$PERM/android.hardware.opengles.aep.xml"
     install -D -m644 "$D/android/libgbm_mesa_wrapper.so" "$LIB/libgbm_mesa_wrapper.so"
     install -D -m644 "$D/android/libgbm_mesa_wrapper_intel.so" "$LIB/libgbm_mesa_wrapper_intel.so"
     # 32-bit processes (the camera provider) use the vendor wrapper directly; the patched one
@@ -121,6 +143,8 @@ install_system() {
     set_prop mesa.vtest.socket.name /data/vtest/vtest.sock
     # all GLES through ANGLE on Venus: Intel must never render into NVIDIA buffers
     set_prop ro.hardware.egl angle
+    # waydroid declares GLES 3.2 by default; ANGLE gives 3.1 (0x30001)
+    set_prop ro.opengles.version 196609
     # gralloc: window buffers allocated by the host (shim); the rest via Intel, linear
     set_prop ro.hardware.gralloc minigbm_gbm_mesa
     set_prop gralloc.gbm.device /dev/dri/renderD128
