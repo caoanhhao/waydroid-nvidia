@@ -10,6 +10,9 @@ Environment=RENDER_SERVER_EXEC_PATH=%h/.local/lib/waydroid-venus/bin/virgl_rende
 # the binaries' RUNPATH ($ORIGIN/../src) points into the build tree; the system
 # libvirglrenderer (no vtest v6) must not be picked up instead
 Environment=LD_LIBRARY_PATH=%h/.local/lib/waydroid-venus/lib
+# expose only the NVIDIA GPU to Android: with every host ICD loaded, Venus also lists the
+# Intel iGPU and apps that pick an integrated GPU (or a GPU whitelist) end up on Intel
+Environment=VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json
 ExecStartPre=/usr/bin/mkdir -p %h/.local/share/waydroid/data/vtest
 ExecStartPre=/usr/bin/chmod 0777 %h/.local/share/waydroid/data/vtest
 ExecStartPre=/usr/bin/rm -f %h/.local/share/waydroid/data/vtest/vtest.sock

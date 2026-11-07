@@ -43,6 +43,10 @@ If they differ from `renderD128` (Intel) / `renderD129` (NVIDIA), edit
 `release/waydroid-vtest.service` (`--rendernode`) and `release/install.sh` (`gralloc.gbm.device`)
 before installing.
 
+The service loads only the NVIDIA Vulkan driver (`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json`),
+so Android sees a single GPU, the RTX 4070, and apps cannot pick the Intel iGPU. If your distribution
+puts `nvidia_icd.json` elsewhere, change that path too.
+
 ## Install
 
 ### Option 1: use the prebuilt files (`release/dist/`)
