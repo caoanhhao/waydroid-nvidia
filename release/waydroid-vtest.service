@@ -16,7 +16,12 @@ Environment=VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json
 ExecStartPre=/usr/bin/mkdir -p %h/.local/share/waydroid/data/vtest
 ExecStartPre=/usr/bin/chmod 0777 %h/.local/share/waydroid/data/vtest
 ExecStartPre=/usr/bin/rm -f %h/.local/share/waydroid/data/vtest/vtest.sock
-ExecStart=%h/.local/lib/waydroid-venus/bin/virgl_test_server --venus --no-virgl --multi-clients \
+# --no-fork: handle every client in this one process instead of fork()ing a full
+# virgl_test_server copy per client. Each Venus context still gets its own
+# virgl_render_server child, so the Vulkan work stays isolated, but the extra
+# test-server tier is gone and the process list no longer grows one extra
+# virgl_test_server per running Android app.
+ExecStart=%h/.local/lib/waydroid-venus/bin/virgl_test_server --venus --no-virgl --no-fork --multi-clients \
     --rendernode /dev/dri/renderD129 \
     --socket-path %h/.local/share/waydroid/data/vtest/vtest.sock
 Restart=always
