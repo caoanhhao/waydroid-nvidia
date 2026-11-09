@@ -1,31 +1,43 @@
 [Unit]
 Description=Venus vtest server for Waydroid (Vulkan on the host GPU)
+# tie the lifetime to the container: vtest comes up before the container's
+# Android init (so Mesa in Android sees the socket on its first connect) and
+# goes down with it, whether you stop the container with systemctl or with
+# `waydroid container stop`
+PartOf=waydroid-container.service
+Before=waydroid-container.service
 # keep retrying (e.g. GPU not ready yet) instead of giving up after 5 fast failures
 StartLimitIntervalSec=0
 
 [Service]
+Type=simple
 # Android apps connect with other uids, so the socket must be world-writable.
 UMask=0000
-Environment=RENDER_SERVER_EXEC_PATH=%h/.local/lib/waydroid-venus/bin/virgl_render_server
+# User= / Group= and WD_DATA (the host path of Android's /data, where the vtest
+# socket lives) are set by the drop-in install.sh writes at
+# /etc/systemd/system/waydroid-vtest.service.d/. %h cannot be used: for a system
+# service it resolves to /root even when User= is set.
+SupplementaryGroups=render video
+# expose only the NVIDIA GPU to Android: with every host ICD loaded, Venus also
+# lists the Intel iGPU and apps that pick an integrated GPU (or a GPU whitelist)
+# end up on Intel
+Environment=VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json
+Environment=RENDER_SERVER_EXEC_PATH=/usr/local/lib/waydroid-venus/bin/virgl_render_server
 # the binaries' RUNPATH ($ORIGIN/../src) points into the build tree; the system
 # libvirglrenderer (no vtest v6) must not be picked up instead
-Environment=LD_LIBRARY_PATH=%h/.local/lib/waydroid-venus/lib
-# expose only the NVIDIA GPU to Android: with every host ICD loaded, Venus also lists the
-# Intel iGPU and apps that pick an integrated GPU (or a GPU whitelist) end up on Intel
-Environment=VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json
-ExecStartPre=/usr/bin/mkdir -p %h/.local/share/waydroid/data/vtest
-ExecStartPre=/usr/bin/chmod 0777 %h/.local/share/waydroid/data/vtest
-ExecStartPre=/usr/bin/rm -f %h/.local/share/waydroid/data/vtest/vtest.sock
+Environment=LD_LIBRARY_PATH=/usr/local/lib/waydroid-venus/lib
+ExecStartPre=/usr/bin/install -d -m 0777 ${WD_DATA}/vtest
+ExecStartPre=/usr/bin/rm -f ${WD_DATA}/vtest/vtest.sock
 # --no-fork: handle every client in this one process instead of fork()ing a full
 # virgl_test_server copy per client. Each Venus context still gets its own
 # virgl_render_server child, so the Vulkan work stays isolated, but the extra
 # test-server tier is gone and the process list no longer grows one extra
 # virgl_test_server per running Android app.
-ExecStart=%h/.local/lib/waydroid-venus/bin/virgl_test_server --venus --no-virgl --no-fork --multi-clients \
+ExecStart=/usr/local/lib/waydroid-venus/bin/virgl_test_server --venus --no-virgl --no-fork --multi-clients \
     --rendernode /dev/dri/renderD129 \
-    --socket-path %h/.local/share/waydroid/data/vtest/vtest.sock
+    --socket-path ${WD_DATA}/vtest/vtest.sock
 Restart=always
 RestartSec=2
 
 [Install]
-WantedBy=default.target
+WantedBy=waydroid-container.service

@@ -1,69 +1,60 @@
 #!/bin/sh
 # Remove Waydroid-on-NVIDIA (Venus) and go back to Intel GLES (the pre-Venus setup).
 #
-#   sudo sh release/uninstall.sh --system   # 1. Android part: overlay files, waydroid.cfg props
-#   sh release/uninstall.sh                 # 2. host part: waydroid-vtest service and files
+#   sudo sh release/uninstall.sh
 set -eu
 CFG=/var/lib/waydroid/waydroid.cfg
 LIB=/var/lib/waydroid/overlay/vendor/lib64
+PREFIX=/usr/local/lib/waydroid-venus
+UNIT=/etc/systemd/system/waydroid-vtest.service
+DROPIN_DIR=/etc/systemd/system/waydroid-vtest.service.d
+
+[ "$(id -u)" = 0 ] || { echo "run with sudo: sudo sh $0" >&2; exit 1; }
+
+WD_USER=${SUDO_USER:-$(logname 2>/dev/null || true)}
+WD_HOME=
+[ -n "$WD_USER" ] && [ "$WD_USER" != root ] && WD_HOME=$(getent passwd "$WD_USER" | cut -d: -f6)
 
 del_prop() { sed -i "/^$1[[:space:]]*=/d" "$CFG"; }
 
-# Android 13 HWUI keeps a per-app Skia shader cache tagged with the GPU driver's identity.
-# When the driver changes, its BlobCache::clear() drops the entries but not the byte count,
-# so an app whose old cache was over 512 KiB crashes with SIGFPE in BlobCache::clean()
-# before it saves a new one, on every launch (venus/notes-blobcache.md). Delete the caches
-# whenever the driver changes; apps rebuild them.
 clear_shader_caches() {
-    data=$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)/.local/share/waydroid/data
+    [ -n "$WD_HOME" ] && data=$WD_HOME/.local/share/waydroid/data || return 0
     [ -d "$data" ] || { echo "no $data: HWUI shader caches not cleared" >&2; return 0; }
     n=$(find "$data/data" "$data/user_de" -maxdepth 4 -path '*/code_cache/com.android.skia.shaders_cache' \
         -print -delete 2>/dev/null | wc -l)
     echo "removed $n HWUI shader caches"
 }
 
-uninstall_system() {
-    [ "$(id -u)" = 0 ] || { echo "run with sudo: sudo sh $0 --system" >&2; exit 1; }
-    waydroid session stop 2>/dev/null || true
-    rm -f "$LIB/hw/vulkan.virtio.so" "$LIB/libgbm_mesa_wrapper.so" "$LIB/libgbm_mesa_wrapper_intel.so"
-    rm -f /var/lib/waydroid/overlay/vendor/lib/libgbm_mesa_wrapper.so
-    rm -f /var/lib/waydroid/overlay/vendor/lib/hw/vulkan.virtio.so
-    rm -f /var/lib/waydroid/overlay/vendor/etc/permissions/android.hardware.vulkan.version.xml \
-          /var/lib/waydroid/overlay/vendor/etc/permissions/android.hardware.opengles.aep.xml
-    rm -f "$LIB/hw/hwcomposer.waydroid.so" "$LIB/hw/hwcomposer.waydroid.real.so"
-    rm -f "$LIB"/egl/lib*_gpuid.so /var/lib/waydroid/overlay/vendor/lib/egl/lib*_gpuid.so \
-          /var/lib/waydroid/overlay/vendor/etc/gpuid.conf
-    for dir in "$LIB/hw" /var/lib/waydroid/overlay/vendor/lib/hw; do
-        rm -f "$dir/android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.so" \
-              "$dir/android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.real.so"
-    done
-    rm -f /var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service \
-          /var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service.real
-    for p in ro.hardware.vulkan mesa.vtest.socket.name gralloc.gbm.linear waydroid.gralloc.vtest \
-             debug.hwui.renderer persist.waydroid.cursor_force_shm mesa.vn.debug ro.logd.size \
-             debug.renderengine.backend debug.mesa.log.level ro.hardware.egl ro.opengles.version \
-             debug.angle.feature_overrides_enabled; do
-        del_prop "$p"
-    done
-    sed -i "/^\[properties\]/a ro.hardware.egl = mesa" "$CFG"
-    clear_shader_caches
-    waydroid upgrade --offline
-    systemctl restart waydroid-container
-    echo "Android part removed; Waydroid uses Intel GLES again. Next: sh $0"
-}
+echo "=== stopping waydroid-container.service (vtest follows)"
+systemctl stop waydroid-container.service 2>/dev/null || true
+systemctl disable waydroid-vtest.service 2>/dev/null || true
+rm -f "$UNIT"
+rm -rf "$DROPIN_DIR"
+rm -rf "$PREFIX"
 
-uninstall_user() {
-    [ "$(id -u)" != 0 ] || { echo "run the host part as your user, without sudo" >&2; exit 1; }
-    systemctl --user disable --now waydroid-vtest.service 2>/dev/null || true
-    rm -f "$HOME/.config/systemd/user/waydroid-vtest.service"
-    systemctl --user daemon-reload
-    rm -rf "$HOME/.local/lib/waydroid-venus"
-    rm -f "$HOME/.local/share/waydroid/data/vtest/vtest.sock"
-    echo "host part removed"
-}
+# retire the old per-user service if a pre-container-bound install left it
+if [ -n "$WD_HOME" ] && [ -f "$WD_HOME/.config/systemd/user/waydroid-vtest.service" ]; then
+    sudo -u "$WD_USER" XDG_RUNTIME_DIR=/run/user/$(id -u "$WD_USER") \
+        systemctl --user disable --now waydroid-vtest.service 2>/dev/null || true
+    rm -f "$WD_HOME/.config/systemd/user/waydroid-vtest.service"
+    rm -rf "$WD_HOME/.local/lib/waydroid-venus"
+fi
 
-case "${1:-}" in
-"") uninstall_user ;;
---system) uninstall_system ;;
-*) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
-esac
+rm -f "$LIB/hw/vulkan.virtio.so" "$LIB/libgbm_mesa_wrapper.so" "$LIB/libgbm_mesa_wrapper_intel.so"
+rm -f "$LIB/hw/hwcomposer.waydroid.so" "$LIB/hw/hwcomposer.waydroid.real.so"
+rm -f /var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service \
+      /var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service.real
+
+for p in ro.hardware.vulkan mesa.vtest.socket.name gralloc.gbm.linear waydroid.gralloc.vtest \
+         debug.hwui.renderer persist.waydroid.cursor_force_shm mesa.vn.debug ro.logd.size \
+         debug.renderengine.backend debug.mesa.log.level ro.hardware.egl; do
+    del_prop "$p"
+done
+sed -i "/^\[properties\]/a ro.hardware.egl = mesa" "$CFG"
+
+clear_shader_caches
+waydroid upgrade --offline
+systemctl daemon-reload
+systemctl start waydroid-container.service
+
+echo "Waydroid uses Intel GLES again."

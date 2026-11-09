@@ -1,56 +1,42 @@
 #!/bin/sh
 # Install Waydroid-on-NVIDIA (Venus) from release/dist (run release/build.sh first).
 #
-#   sh release/install.sh                 # 1. host part, as your user (no sudo):
-#                                         #    vtest server in ~/.local/lib/waydroid-venus
-#                                         #    + systemd user service waydroid-vtest
-#   sudo sh release/install.sh --system   # 2. Android part, as root: driver + gralloc shim
-#                                         #    into the Waydroid overlay, waydroid.cfg props
+#   sudo sh release/install.sh             # production: copy files, install service
+#   sudo sh release/install.sh --dev       # dev: symlink binaries + service file
+#                                          #      from this checkout, so edits to the
+#                                          #      .service or a rebuild of the binaries
+#                                          #      take effect on `systemctl daemon-reload`
+#                                          #      and the next container restart
 #
-# Afterwards start/stop Waydroid as usual (app menu / waydroid show-full-ui /
-# waydroid session stop). The service starts with your login session.
+# Everything belongs to the Waydroid container: vtest is a system service with
+# PartOf=waydroid-container.service, so it starts/stops alongside the container.
+# Just run Waydroid as usual (app menu / waydroid show-full-ui / waydroid session stop).
 set -eu
 REL=$(cd "$(dirname "$0")" && pwd)
 D=$REL/dist
 
+DEV=0
+[ "${1:-}" = "--dev" ] && { DEV=1; shift; }
+
+[ "$(id -u)" = 0 ] || { echo "run with sudo: sudo sh $0 [--dev]" >&2; exit 1; }
 [ -f "$D/android/vulkan.virtio.so" ] || { echo "missing $D, run release/build.sh" >&2; exit 1; }
 
-install_user() {
-    [ "$(id -u)" != 0 ] || { echo "run the host part as your user, without sudo" >&2; exit 1; }
-    PREFIX=$HOME/.local/lib/waydroid-venus
-    UNIT=$HOME/.config/systemd/user/waydroid-vtest.service
+# Waydroid is single-user: the container bind-mounts $HOME/.local/share/waydroid/data
+# of one login user into /data. Detect that user from the invoking sudo and bake it
+# into a drop-in so %h in the unit resolves to the right home.
+WD_USER=${SUDO_USER:-$(logname 2>/dev/null || true)}
+[ -n "$WD_USER" ] && [ "$WD_USER" != root ] || { echo "cannot determine the Waydroid user; run with sudo from that account" >&2; exit 1; }
+WD_HOME=$(getent passwd "$WD_USER" | cut -d: -f6)
+[ -n "$WD_HOME" ] && [ -d "$WD_HOME" ] || { echo "no home for $WD_USER" >&2; exit 1; }
 
-    # Android loses its GPU when the server restarts, so stop a running session first
-    if waydroid status 2>/dev/null | grep -q 'Session:.*RUNNING'; then
-        echo "stopping the running Waydroid session"
-        waydroid session stop
-    fi
-    # a server started by hand would hold the socket
-    if pgrep -f 'virgl_test_server.*waydroid/data/vtest' >/dev/null &&
-        ! systemctl --user -q is-active waydroid-vtest.service; then
-        echo "a vtest server not run by waydroid-vtest.service is serving the socket; stop it first" >&2
-        exit 1
-    fi
+PREFIX=/usr/local/lib/waydroid-venus
+UNIT=/etc/systemd/system/waydroid-vtest.service
+DROPIN=/etc/systemd/system/waydroid-vtest.service.d/user.conf
 
-    echo "=== host: vtest server -> $PREFIX"
-    rm -rf "$PREFIX"
-    mkdir -p "$PREFIX/bin" "$PREFIX/lib" "$(dirname "$UNIT")"
-    cp "$D"/host/bin/* "$PREFIX/bin/"
-    cp -P "$D"/host/lib/* "$PREFIX/lib/"
-    cp "$D/VERSION" "$PREFIX/"
-    cp "$REL/waydroid-vtest.service" "$UNIT"
-    systemctl --user daemon-reload
-    systemctl --user enable waydroid-vtest.service
-    systemctl --user restart waydroid-vtest.service
-    sleep 1
-    systemctl --user --no-pager status waydroid-vtest.service | head -3
-    ls -l "$HOME/.local/share/waydroid/data/vtest/vtest.sock"
-    echo "next: sudo sh $0 --system"
-}
+CFG=/var/lib/waydroid/waydroid.cfg
 
 # replace every copy of "key = value" in [properties]: waydroid refuses to parse
 # a config with a duplicate key
-CFG=/var/lib/waydroid/waydroid.cfg
 del_prop() { sed -i "/^$1[[:space:]]*=/d" "$CFG"; }
 set_prop() {
     del_prop "$1"
@@ -63,121 +49,105 @@ set_prop() {
 # before it saves a new one, on every launch (venus/notes-blobcache.md). Delete the caches
 # whenever the driver changes; apps rebuild them.
 clear_shader_caches() {
-    data=$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)/.local/share/waydroid/data
+    data=$WD_HOME/.local/share/waydroid/data
     [ -d "$data" ] || { echo "no $data: HWUI shader caches not cleared" >&2; return 0; }
     n=$(find "$data/data" "$data/user_de" -maxdepth 4 -path '*/code_cache/com.android.skia.shaders_cache' \
         -print -delete 2>/dev/null | wc -l)
     echo "removed $n HWUI shader caches"
 }
 
-install_system() {
-    [ "$(id -u)" = 0 ] || { echo "run the Android part with sudo: sudo sh $0 --system" >&2; exit 1; }
-    LIB=/var/lib/waydroid/overlay/vendor/lib64
+# retire the old per-user service if it's there (pre-container-bound release)
+if [ -f "$WD_HOME/.config/systemd/user/waydroid-vtest.service" ]; then
+    echo "=== removing the old user-service install (now a system service)"
+    sudo -u "$WD_USER" XDG_RUNTIME_DIR=/run/user/$(id -u "$WD_USER") \
+        systemctl --user disable --now waydroid-vtest.service 2>/dev/null || true
+    rm -f "$WD_HOME/.config/systemd/user/waydroid-vtest.service"
+fi
 
-    echo "=== Android: overlay + props"
-    waydroid session stop 2>/dev/null || true
-    install -D -m644 "$D/android/vulkan.virtio.so" "$LIB/hw/vulkan.virtio.so"
-    # 32-bit processes (x86, and armeabi-v7a apps through the native bridge) load
-    # vendor/lib/hw; vendor.img's own 32-bit Venus cannot reach the vtest socket, so they
-    # had no GPU at all
-    install -D -m644 "$D/android/lib/vulkan.virtio.so" /var/lib/waydroid/overlay/vendor/lib/hw/vulkan.virtio.so
-    # declare what the GPU really offers (CTS checks it against the driver): Vulkan 1.3,
-    # the API version Venus reports for the NVIDIA GPU. GLES 3.2 + the Android Extension
-    # Pack stay as vendor.img declares them (ANGLE gives them, see the props below)
-    PERM=/var/lib/waydroid/overlay/vendor/etc/permissions
-    mkdir -p "$PERM"
-    cat >"$PERM/android.hardware.vulkan.version.xml" <<'EOF'
-<?xml version="1.0" encoding="utf-8"?>
-<!-- Vulkan 1.3 (0x403000): the API version Venus reports for the NVIDIA GPU -->
-<permissions>
-    <feature name="android.hardware.vulkan.version" version="4206592" />
-</permissions>
+# vtest is PartOf=waydroid-container.service, so stopping the container first
+# brings vtest down cleanly before we touch its binaries
+echo "=== stopping waydroid-container.service (vtest follows)"
+systemctl stop waydroid-container.service 2>/dev/null || true
+
+echo "=== host: vtest server -> $PREFIX  (dev=$DEV)"
+rm -rf "$PREFIX"
+if [ "$DEV" = 1 ]; then
+    ln -sfn "$D/host" "$PREFIX"
+else
+    mkdir -p "$PREFIX/bin" "$PREFIX/lib"
+    cp "$D"/host/bin/* "$PREFIX/bin/"
+    cp -P "$D"/host/lib/* "$PREFIX/lib/"
+    cp "$D/VERSION" "$PREFIX/"
+fi
+
+echo "=== systemd unit -> $UNIT  (dev=$DEV)"
+rm -f "$UNIT"
+if [ "$DEV" = 1 ]; then
+    ln -sfn "$REL/waydroid-vtest.service" "$UNIT"
+else
+    install -m644 "$REL/waydroid-vtest.service" "$UNIT"
+fi
+mkdir -p "$(dirname "$DROPIN")"
+cat >"$DROPIN" <<EOF
+# generated by release/install.sh for Waydroid user $WD_USER
+[Service]
+User=$WD_USER
+Group=$WD_USER
+Environment=WD_DATA=$WD_HOME/.local/share/waydroid/data
 EOF
-    chmod 644 "$PERM/android.hardware.vulkan.version.xml"
-    rm -f "$PERM/android.hardware.opengles.aep.xml"
-    install -D -m644 "$D/android/libgbm_mesa_wrapper.so" "$LIB/libgbm_mesa_wrapper.so"
-    install -D -m644 "$D/android/libgbm_mesa_wrapper_intel.so" "$LIB/libgbm_mesa_wrapper_intel.so"
-    # 32-bit processes (the camera provider) use the vendor wrapper directly; the patched one
-    # can map BLOB buffers (camera JPEG output)
-    install -D -m644 "$D/android/lib/libgbm_mesa_wrapper.so" /var/lib/waydroid/overlay/vendor/lib/libgbm_mesa_wrapper.so
-    # composer: run it with libnativewindow preloaded so ANGLE's EGL image import works
-    # there. The wrapper replaces the binary; the vendor.img one moves next to it as .real.
-    BIN=/var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service
-    IMG=$(sed -n 's/^images_path = //p' "$CFG")/vendor.img
-    mkdir -p "$(dirname "$BIN")"
-    rm -f "$BIN.real"
-    debugfs -R "dump /bin/hw/android.hardware.graphics.composer@2.1-service $BIN.real" "$IMG" 2>/dev/null
-    [ -s "$BIN.real" ] || { echo "cannot read the composer from $IMG" >&2; exit 1; }
-    chmod 755 "$BIN.real"
-    install -D -m755 "$D/android/composer-preload-wrapper" "$BIN"
-    # hwcomposer: a shim module lets SurfaceFlinger compose the layers Hyprland can't
-    # import (YV12 video frames) instead of sending them to Wayland, which kills the
-    # composer. It loads the vendor.img module, copied next to it as .real.so.
-    rm -f "$LIB/hw/hwcomposer.waydroid.real.so"
-    debugfs -R "dump /lib64/hw/hwcomposer.waydroid.so $LIB/hw/hwcomposer.waydroid.real.so" "$IMG" 2>/dev/null
-    [ -s "$LIB/hw/hwcomposer.waydroid.real.so" ] || { echo "cannot read hwcomposer from $IMG" >&2; exit 1; }
-    chmod 644 "$LIB/hw/hwcomposer.waydroid.real.so"
-    install -D -m644 "$D/android/hwcomposer.waydroid.so" "$LIB/hw/hwcomposer.waydroid.so"
-    # gralloc4 mapper: a shim gives single-plane YV12 buffers real Cr/Cb plane layouts, so
-    # CPU writers (camera, software codecs) put chroma where Mesa reads it (green camera
-    # preview otherwise). It loads the vendor.img mapper, copied next to it as .real.so.
-    # Both ABIs: the camera provider is a 32-bit process.
-    MAPPER=android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa
-    for abi in lib64:"$D/android" lib:"$D/android/lib"; do
-        dir=/var/lib/waydroid/overlay/vendor/${abi%%:*}/hw
-        mkdir -p "$dir"
-        rm -f "$dir/$MAPPER.real.so"
-        debugfs -R "dump /${abi%%:*}/hw/$MAPPER.so $dir/$MAPPER.real.so" "$IMG" 2>/dev/null
-        [ -s "$dir/$MAPPER.real.so" ] || { echo "cannot read /${abi%%:*}/hw/$MAPPER.so from $IMG" >&2; exit 1; }
-        chmod 644 "$dir/$MAPPER.real.so"
-        install -D -m644 "${abi#*:}/$MAPPER.so" "$dir/$MAPPER.so"
-    done
-    # GLES driver: the gpuid shim, which is ANGLE except that the apps in gpuid.conf read
-    # a GL_RENDERER their GPU whitelist knows (Genshin Impact only turns on Vulkan for
-    # Adreno/Mali/Xclipse names; it renders on Venus/NVIDIA either way)
-    for abi in lib64:"$D/android/egl" lib:"$D/android/lib/egl"; do
-        mkdir -p "/var/lib/waydroid/overlay/vendor/${abi%%:*}/egl"
-        install -m644 "${abi#*:}"/lib*_gpuid.so "/var/lib/waydroid/overlay/vendor/${abi%%:*}/egl/"
-    done
-    install -D -m644 "$D/android/gpuid.conf" /var/lib/waydroid/overlay/vendor/etc/gpuid.conf
-    sed -i 's/^mount_overlays = .*/mount_overlays = True/' "$CFG"
 
-    # Vulkan: Venus over the vtest socket (host waydroid-vtest.service)
-    set_prop ro.hardware.vulkan virtio
-    set_prop mesa.vtest.socket.name /data/vtest/vtest.sock
-    # all GLES through ANGLE on Venus (via the gpuid shim above): Intel must never render
-    # into NVIDIA buffers
-    set_prop ro.hardware.egl gpuid
-    # GLES 3.2 + AEP: ANGLE in Android 13 stops at 3.1 unless told to expose versions it
-    # has not passed conformance for, although Venus has every feature they need. The
-    # override only adds ES 3.2 and its extensions (geometry/tessellation shaders, texture
-    # buffers, GL_ANDROID_extension_pack_es31a); venus/tests/android-gles32-test.c draws
-    # with each on every ABI
-    set_prop debug.angle.feature_overrides_enabled exposeNonConformantExtensionsAndVersions
-    set_prop ro.opengles.version 196610
-    # gralloc: window buffers allocated by the host (shim); the rest via Intel, linear
-    set_prop ro.hardware.gralloc minigbm_gbm_mesa
-    set_prop gralloc.gbm.device /dev/dri/renderD128
-    set_prop gralloc.gbm.linear 1
-    set_prop waydroid.gralloc.vtest 1
-    set_prop debug.hwui.renderer skiavk
-    # cursor through the composer's EGL readback into shm (the wrapper above fixes
-    # its crash); a dma-buf cursor is a LINEAR buffer Hyprland/NVIDIA cannot show
-    del_prop persist.waydroid.cursor_force_shm
-    # leftovers from debugging
-    for p in mesa.vn.debug ro.logd.size debug.renderengine.backend debug.mesa.log.level; do
-        del_prop "$p"
-    done
+LIB=/var/lib/waydroid/overlay/vendor/lib64
+echo "=== Android: overlay + props"
+install -D -m644 "$D/android/vulkan.virtio.so" "$LIB/hw/vulkan.virtio.so"
+install -D -m644 "$D/android/libgbm_mesa_wrapper.so" "$LIB/libgbm_mesa_wrapper.so"
+install -D -m644 "$D/android/libgbm_mesa_wrapper_intel.so" "$LIB/libgbm_mesa_wrapper_intel.so"
+# composer: run it with libnativewindow preloaded so ANGLE's EGL image import works
+# there. The wrapper replaces the binary; the vendor.img one moves next to it as .real.
+BIN=/var/lib/waydroid/overlay/vendor/bin/hw/android.hardware.graphics.composer@2.1-service
+IMG=$(sed -n 's/^images_path = //p' "$CFG")/vendor.img
+mkdir -p "$(dirname "$BIN")"
+rm -f "$BIN.real"
+debugfs -R "dump /bin/hw/android.hardware.graphics.composer@2.1-service $BIN.real" "$IMG" 2>/dev/null
+[ -s "$BIN.real" ] || { echo "cannot read the composer from $IMG" >&2; exit 1; }
+chmod 755 "$BIN.real"
+install -D -m755 "$D/android/composer-preload-wrapper" "$BIN"
+# hwcomposer: a shim module lets SurfaceFlinger compose the layers Hyprland can't
+# import (YV12 video frames) instead of sending them to Wayland, which kills the
+# composer. It loads the vendor.img module, copied next to it as .real.so.
+rm -f "$LIB/hw/hwcomposer.waydroid.real.so"
+debugfs -R "dump /lib64/hw/hwcomposer.waydroid.so $LIB/hw/hwcomposer.waydroid.real.so" "$IMG" 2>/dev/null
+[ -s "$LIB/hw/hwcomposer.waydroid.real.so" ] || { echo "cannot read hwcomposer from $IMG" >&2; exit 1; }
+chmod 644 "$LIB/hw/hwcomposer.waydroid.real.so"
+install -D -m644 "$D/android/hwcomposer.waydroid.so" "$LIB/hw/hwcomposer.waydroid.so"
+sed -i 's/^mount_overlays = .*/mount_overlays = True/' "$CFG"
 
-    clear_shader_caches
-    waydroid upgrade --offline
-    systemctl restart waydroid-container
-    echo "=== done ($(head -1 "$D/VERSION"))"
-    echo "Start Waydroid as usual: waydroid show-full-ui (or the app menu). Stop: waydroid session stop"
-}
+# Vulkan: Venus over the vtest socket (host waydroid-vtest.service)
+set_prop ro.hardware.vulkan virtio
+set_prop mesa.vtest.socket.name /data/vtest/vtest.sock
+# all GLES through ANGLE on Venus: Intel must never render into NVIDIA buffers
+set_prop ro.hardware.egl angle
+# gralloc: window buffers allocated by the host (shim); the rest via Intel, linear
+set_prop ro.hardware.gralloc minigbm_gbm_mesa
+set_prop gralloc.gbm.device /dev/dri/renderD128
+set_prop gralloc.gbm.linear 1
+set_prop waydroid.gralloc.vtest 1
+set_prop debug.hwui.renderer skiavk
+# cursor through the composer's EGL readback into shm (the wrapper above fixes
+# its crash); a dma-buf cursor is a LINEAR buffer Hyprland/NVIDIA cannot show
+del_prop persist.waydroid.cursor_force_shm
+# leftovers from debugging
+for p in mesa.vn.debug ro.logd.size debug.renderengine.backend debug.mesa.log.level; do
+    del_prop "$p"
+done
 
-case "${1:-}" in
-"") install_user ;;
---system) install_system ;;
-*) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
-esac
+clear_shader_caches
+waydroid upgrade --offline
+
+echo "=== enabling + starting waydroid-vtest.service (bound to the container)"
+systemctl daemon-reload
+systemctl enable waydroid-vtest.service
+systemctl start waydroid-container.service
+
+echo "=== done ($(cat "$D/VERSION" 2>/dev/null | head -1 || echo dev))"
+echo "Start Waydroid as usual: waydroid show-full-ui (or the app menu). Stop: waydroid session stop"
+echo "vtest status: systemctl status waydroid-vtest.service"
