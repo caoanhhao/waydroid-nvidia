@@ -1,5 +1,5 @@
 From 4830ea2c2d3d592946ba59ce18c7bb8d10b476e4 Mon Sep 17 00:00:00 2001
-From: caoanhhao <caoanhhao2@gmail.com>
+From: caoanhhao <caoanhhao@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 14:28:32 +0700
 Subject: [PATCH] venus/android: report the host GPU by its own name
 

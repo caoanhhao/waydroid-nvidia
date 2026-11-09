@@ -12,7 +12,8 @@ App / SurfaceFlinger (Android)
   └─ OpenGL ES: ANGLE → Venus
         │  unix socket /data/vtest/vtest.sock
         ▼
-virgl_test_server (host, patched, vtest v6)  ← systemd user service `waydroid-vtest`
+virgl_test_server (host, patched, vtest v6)  ← systemd service `waydroid-vtest`
+                                               (tied to waydroid-container.service)
         ▼
 NVIDIA Vulkan (nvidia-open) → RTX 4070 → Hyprland
 ```
@@ -74,23 +75,28 @@ puts `nvidia_icd.json` elsewhere, change that path too.
 
 ### Option 1: use the prebuilt files (`release/dist/`)
 
-If `release/dist/` already has files (see `release/dist/VERSION`), two steps are enough.
+If `release/dist/` already has files (see `release/dist/VERSION`), one command does everything:
 
-1. Host part, as your normal user, without sudo. This installs the server into
-   `~/.local/lib/waydroid-venus`, enables the `waydroid-vtest` service, and stops Waydroid if it
-   is running.
+```bash
+sudo sh release/install.sh
+```
 
-   ```bash
-   sh release/install.sh
-   ```
+This copies the host binaries to `/usr/local/lib/waydroid-venus/`, installs the
+`waydroid-vtest.service` system unit bound to `waydroid-container.service` (with a drop-in
+that bakes in the Waydroid user's home), copies the Android overlay files into
+`/var/lib/waydroid/overlay/`, writes the properties in `/var/lib/waydroid/waydroid.cfg`, and
+restarts `waydroid-container`. vtest now starts automatically with the container and stops
+with it; no user systemd service.
 
-2. Android part, with sudo. This copies the driver and the gralloc shim into the Waydroid
-   overlay, sets the properties in `/var/lib/waydroid/waydroid.cfg`, and restarts
-   `waydroid-container`.
+While hacking on this checkout, pass `--dev` instead:
 
-   ```bash
-   sudo sh release/install.sh --system
-   ```
+```bash
+sudo sh release/install.sh --dev
+```
+
+The service file and the binaries directory are symlinked back into the repo, so editing
+`release/waydroid-vtest.service` or rebuilding the host binaries take effect on
+`sudo systemctl daemon-reload && sudo systemctl restart waydroid-container` — no reinstall.
 
 ### Option 2: build from source
 
@@ -277,20 +283,17 @@ sudo waydroid shell -- ls -l /data/tombstones
 
 ## Uninstall (back to OpenGL on Intel)
 
-1. Android part:
+One command removes everything:
 
-   ```bash
-   sudo sh release/uninstall.sh --system
-   ```
+```bash
+sudo sh release/uninstall.sh
+```
 
-2. Host part:
-
-   ```bash
-   sh release/uninstall.sh
-   ```
-
-Waydroid goes back to the Intel setup (`ro.hardware.egl = mesa`). Copies of the original
-configuration, from before any change, are in `backups/`.
+It stops `waydroid-container.service` (which stops vtest via `PartOf=`), removes the
+`waydroid-vtest.service` system unit and its drop-in, deletes `/usr/local/lib/waydroid-venus/`,
+strips the overlay files from `/var/lib/waydroid/overlay/`, resets the `ro.hardware.egl` property
+to `mesa`, and starts the container again. Also cleans up a leftover per-user `waydroid-vtest`
+service from older installs. Copies of the original configuration are in `backups/`.
 
 ## Known limitations
 

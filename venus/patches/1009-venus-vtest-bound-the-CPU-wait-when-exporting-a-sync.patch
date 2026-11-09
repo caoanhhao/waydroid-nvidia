@@ -1,5 +1,5 @@
 From c384405ebf40edcf7004f8e34d664fd1f54ca591 Mon Sep 17 00:00:00 2001
-From: caoanhhao <caoanhhao2@gmail.com>
+From: caoanhhao <caoanhhao@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 07:37:54 +0700
 Subject: [PATCH] venus/vtest: bound the CPU wait when exporting a sync fd
 

@@ -1,5 +1,5 @@
 From 2d01ffb407b560b2ea6fce0e715e730ff1f51aeb Mon Sep 17 00:00:00 2001
-From: caoanhhao <caoanhhao2@gmail.com>
+From: caoanhhao <caoanhhao@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 11:44:27 +0700
 Subject: [PATCH] vtest: add VCMD_RESOURCE_IMPORT_BLOB (protocol version 5)
 

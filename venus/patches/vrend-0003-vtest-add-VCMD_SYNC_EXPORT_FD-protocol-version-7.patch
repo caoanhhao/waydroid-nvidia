@@ -1,5 +1,5 @@
 From 9199d745433e28875990ba0c9edc945f4c0a2c68 Mon Sep 17 00:00:00 2001
-From: caoanhhao <caoanhhao2@gmail.com>
+From: caoanhhao <caoanhhao@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 14:18:08 +0700
 Subject: [PATCH] vtest: add VCMD_SYNC_EXPORT_FD (protocol version 7)
 

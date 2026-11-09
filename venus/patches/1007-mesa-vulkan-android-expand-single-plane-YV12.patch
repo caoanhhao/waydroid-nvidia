@@ -1,5 +1,5 @@
 From 61ad7d97bf9687ea3a63a1c762eda0ed5c66a715 Mon Sep 17 00:00:00 2001
-From: caoanhhao <caoanhhao2@gmail.com>
+From: caoanhhao <caoanhhao@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 17:07:13 +0700
 Subject: [PATCH] vulkan/android: expand single-plane YV12 from gralloc into
  three planes

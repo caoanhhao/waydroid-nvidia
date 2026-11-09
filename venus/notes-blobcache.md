@@ -95,7 +95,7 @@ Rejected options:
 ## One-off fix for the current install (sudo)
 
 ```
-sudo find /home/caoanhhao/.local/share/waydroid/data/data /home/caoanhhao/.local/share/waydroid/data/user_de \
+sudo find ~/.local/share/waydroid/data/data ~/.local/share/waydroid/data/user_de \
   -maxdepth 4 -path '*/code_cache/com.android.skia.shaders_cache' -printf '%s %p\n' -delete
 ```
 

@@ -15,8 +15,8 @@ Waydroid (LineageOS 20 / Android 13) renders on the NVIDIA RTX 4070 while the ho
 | `dist/android/vulkan.virtio.so` | overlay `/vendor/lib64/hw/` |
 | `dist/android/libgbm_mesa_wrapper.so` (vtest shim) | overlay `/vendor/lib64/` |
 | `dist/android/libgbm_mesa_wrapper_intel.so` (Stage A wrapper) | overlay `/vendor/lib64/` |
-| `dist/host/bin/*`, `dist/host/lib/*` | `~/.local/lib/waydroid-venus/` |
-| `waydroid-vtest.service` | `~/.config/systemd/user/`, enabled for `default.target` |
+| `dist/host/bin/*`, `dist/host/lib/*` | `/usr/local/lib/waydroid-venus/` |
+| `waydroid-vtest.service` | `/etc/systemd/system/`, bound to `waydroid-container.service` |
 
 ## Build
 
@@ -33,26 +33,25 @@ This copies the pieces into `release/dist/` and writes `VERSION` and `SHA256SUMS
 ## Install
 
 ```bash
-sh release/install.sh
+sudo sh release/install.sh
 ```
 
-```bash
-sudo sh release/install.sh --system
-```
+Copies the host binaries, installs `waydroid-vtest.service` system unit (tied to
+`waydroid-container.service`), installs the Android overlay files, sets the `waydroid.cfg`
+properties, runs `waydroid upgrade --offline` and restarts `waydroid-container`.
 
-The first command runs as your user. It stops a running Waydroid session, installs the server,
-and enables and starts `waydroid-vtest.service`. The second installs the overlay files, sets the
-`waydroid.cfg` properties, removes debug properties, and runs `waydroid upgrade --offline` and
-restarts `waydroid-container`.
+Add `--dev` to symlink the unit and the binaries dir back into this checkout; edits to
+the service file or a rebuild then take effect on
+`sudo systemctl daemon-reload && sudo systemctl restart waydroid-container`.
 
 After that, use Waydroid as usual: the app menu, `waydroid show-full-ui`, and
-`waydroid session stop`. The service starts at login. To update after a rebuild, run
-`build.sh` and both install commands again.
+`waydroid session stop`. vtest starts with the container and stops with it. To update after
+a rebuild, run `build.sh` and `install.sh` again.
 
 Check:
 
 ```bash
-systemctl --user status waydroid-vtest
+systemctl status waydroid-vtest
 ```
 
 ```bash
@@ -65,18 +64,14 @@ The second command should print `Pipeline=Skia (Vulkan)`. `nvidia-smi` should li
 ## Uninstall (back to Intel GLES)
 
 ```bash
-sudo sh release/uninstall.sh --system
-```
-
-```bash
-sh release/uninstall.sh
+sudo sh release/uninstall.sh
 ```
 
 ## Known issues
 
-- **The server must run before Android starts.** Without it SurfaceFlinger aborts (`no suitable
-  EGLConfig found`). Restarting the service while Waydroid runs kills Android's GPU clients,
-  so restart Waydroid after it (`waydroid session stop`, then open it again).
+- **The server must run before Android starts.** The unit is `Before=waydroid-container.service`
+  so this is automatic, but restarting vtest alone while the container runs kills Android's GPU
+  clients — restart the container instead (`sudo systemctl restart waydroid-container`).
 - **Fences are CPU waits.** `failed to dup EGL native fence sync` is logged on every frame
   (Mesa patch 0001). Performance has not been measured.
 - **Multi-window mode is untested.** It uses the composer EGL path fixed for the cursor
@@ -112,15 +107,15 @@ Details: `venus/notes-tiktok.md`.
 Fixed: the Play Store crashed on every launch (SIGFPE in libhwui `BlobCache::clean()`).
 HWUI tags each app's Skia shader cache with the GPU driver; after the switch from GLES to Vulkan
 the old cache fails that check, and Android 13's `BlobCache::clear()` keeps the old byte count.
-An app whose old cache was over 512 KiB then crashes before it saves a new one. Both
-`--system` scripts now delete `code_cache/com.android.skia.shaders_cache` for every app, and apps
-rebuild them. Details: `venus/notes-blobcache.md`.
+An app whose old cache was over 512 KiB then crashes before it saves a new one. `install.sh`
+and `uninstall.sh` now delete `code_cache/com.android.skia.shaders_cache` for every app, and
+apps rebuild them. Details: `venus/notes-blobcache.md`.
 
 Fixed: games that ship only ASTC textures (Delta Force, UE4) crashed at launch. The RTX 4070's
 Vulkan has no ASTC, so every texture failed to load. Venus now emulates ASTC LDR (Mesa patch
 1008): those images are RGBA8 on the host, and uploads are decoded on the CPU. GLES apps
 get ASTC through ANGLE as well. `VN_DEBUG=no_astc_emu` turns it off. Rebuild with
-`build.sh` to pick it up. Details: `venus/notes-deltaforce.md`.
+`build.sh` to pick it up.
 
 Fixed: Waydroid could stay on the boot animation after boot. When the host render server
 dropped bootanimation's Vulkan context (a CS error during boot), Venus waited forever in

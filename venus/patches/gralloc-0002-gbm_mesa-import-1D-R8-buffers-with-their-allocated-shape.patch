@@ -1,5 +1,5 @@
 From ede953d0d008d102050cd4902101e77dbf33b259 Mon Sep 17 00:00:00 2001
-From: caoanhhao <caoanhhao2@gmail.com>
+From: caoanhhao <caoanhhao@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 12:57:50 +0700
 Subject: [PATCH] gbm_mesa: import and map 1D R8 buffers with their allocated
  shape

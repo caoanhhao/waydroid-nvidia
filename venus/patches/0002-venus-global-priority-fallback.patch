@@ -1,5 +1,5 @@
 From a4f948ecccd224ccf18f4a3903c6b0cfb6f729f8 Mon Sep 17 00:00:00 2001
-From: caoanhhao <caoanhhao2@gmail.com>
+From: caoanhhao <caoanhhao@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 11:38:21 +0700
 Subject: [PATCH] venus: fall back to default queue priority when global
  priority is not permitted

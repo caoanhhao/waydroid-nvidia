@@ -10,7 +10,7 @@
 #   sudo sh venus/deploy-fence.sh rollback --system  # Android: restore the saved driver
 #   sh venus/deploy-fence.sh status
 #
-# Backups: ~/.local/lib/waydroid-venus.pre-fence and
+# Backups: /usr/local/lib/waydroid-venus.pre-fence and
 # /var/lib/waydroid/overlay/vendor/lib64/hw/vulkan.virtio.so.pre-fence
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -29,7 +29,7 @@ stop_session() {
 
 host_install() {
     [ "$(id -u)" != 0 ] || { echo "run the host part as your user, without sudo" >&2; exit 1; }
-    P=$HOME/.local/lib/waydroid-venus
+    P=/usr/local/lib/waydroid-venus
     [ -x "$VB/vtest/virgl_test_server" ] || { echo "missing $VB, build src/virglrenderer-fence first" >&2; exit 1; }
     [ -d "$P" ] || { echo "missing $P, run release/install.sh first" >&2; exit 1; }
     stop_session
@@ -50,7 +50,7 @@ host_install() {
 
 host_rollback() {
     [ "$(id -u)" != 0 ] || { echo "run the host part as your user, without sudo" >&2; exit 1; }
-    P=$HOME/.local/lib/waydroid-venus
+    P=/usr/local/lib/waydroid-venus
     [ -d "$P.pre-fence" ] || { echo "no backup at $P.pre-fence, nothing to roll back" >&2; exit 1; }
     stop_session
     systemctl --user stop waydroid-vtest.service
@@ -85,7 +85,7 @@ install:--system) android_install ;;
 rollback:host) host_rollback ;;
 rollback:--system) android_rollback ;;
 status:*)
-    P=$HOME/.local/lib/waydroid-venus
+    P=/usr/local/lib/waydroid-venus
     echo "host: $( [ -f "$P/VERSION.fence" ] && cat "$P/VERSION.fence" || echo 'release server (no fence build)')"
     [ -d "$P.pre-fence" ] && echo "      backup: $P.pre-fence"
     ls -l "$HW"/vulkan.virtio.so* 2>/dev/null || echo "android: overlay not readable (try sudo)"

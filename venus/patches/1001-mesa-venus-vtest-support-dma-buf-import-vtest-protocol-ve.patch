@@ -1,5 +1,5 @@
 From aca424fcde57128b3ca90d073fdcd1a02742c5dc Mon Sep 17 00:00:00 2001
-From: caoanhhao <caoanhhao2@gmail.com>
+From: caoanhhao <caoanhhao@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 11:44:27 +0700
 Subject: [PATCH] venus/vtest: support dma-buf import (vtest protocol version
  5)
