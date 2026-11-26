@@ -1,0 +1,727 @@
+From 9199d745433e28875990ba0c9edc945f4c0a2c68 Mon Sep 17 00:00:00 2001
+From: caoanhhao <caoanhhao2@gmail.com>
+Date: Thu, 5 Nov 2026 14:18:08 +0700
+Subject: [PATCH] vtest: add VCMD_SYNC_EXPORT_FD (protocol version 7)
+
+Let a Venus vtest client export real sync_files for its syncs instead of
+waiting for them on the CPU and handing out -1.
+
+VCMD_SYNC_EXPORT_FD takes a sync id and value.  The server finds the
+pending timeline submit that signals the sync to that value and asks the
+context to export a fence for its ring:
+
+- virgl_renderer_context_export_fence() and a new optional
+  virgl_context::export_fence hook;
+- the proxy skips the round trip when the fence already signaled, and
+  otherwise sends RENDER_CONTEXT_OP_EXPORT_FENCE to the render server;
+- vkr submits an empty batch with a SYNC_FD exportable VkFence to the
+  ring's queue and returns vkGetFenceFdKHR(SYNC_FD).  Exporting resets the
+  fence, so one fence per queue is reused.
+
+The sync_file covers all work submitted to the ring so far, so it may
+signal later than strictly needed, never earlier.  The reply is a status
+(signaled / fd follows / unavailable) and the fd over SCM_RIGHTS.  When
+an fd or 'signaled' is returned, the sync is detached from pending
+submits, matching the copy-transference reset the client does next.
+
+The render server and libvirglrenderer must come from the same build: an
+older render server rejects the new op.
+
+caoanhhao used AI to code
+---
+ server/render_context.c   |  23 ++++++++
+ server/render_protocol.h  |  19 +++++++
+ server/render_state.c     |   7 +++
+ server/render_state.h     |   3 +
+ src/proxy/proxy_context.c |  61 ++++++++++++++++++++
+ src/venus/vkr_context.c   |  17 ++++++
+ src/venus/vkr_context.h   |   3 +
+ src/venus/vkr_queue.c     |  67 ++++++++++++++++++++++
+ src/venus/vkr_queue.h     |   8 +++
+ src/venus/vkr_renderer.c  |  13 +++++
+ src/venus/vkr_renderer.h  |   3 +
+ src/virgl_context.h       |   8 +++
+ src/virglrenderer.c       |  17 ++++++
+ src/virglrenderer.h       |  10 ++++
+ vtest/vtest.h             |   3 +
+ vtest/vtest_protocol.h    |  31 ++++++++++-
+ vtest/vtest_renderer.c    | 113 +++++++++++++++++++++++++++++++++++++-
+ vtest/vtest_server.c      |   3 +
+ 18 files changed, 406 insertions(+), 3 deletions(-)
+
+diff --git a/server/render_context.c b/server/render_context.c
+index b44b5b58..173c4fc7 100644
+--- a/server/render_context.c
++++ b/server/render_context.c
+@@ -38,6 +38,28 @@ render_context_dispatch_submit_fence(struct render_context *ctx,
+                                     req->ring_index, req->seqno);
+ }
+ 
++static bool
++render_context_dispatch_export_fence(struct render_context *ctx,
++                                     const union render_context_op_request *request,
++                                     UNUSED const int *fds,
++                                     UNUSED int fd_count)
++{
++   const struct render_context_op_export_fence_request *req = &request->export_fence;
++   struct render_context_op_export_fence_reply reply = { .ret = -EINVAL };
++   int fd = -1;
++
++   if (req->ring_index < (uint32_t)ctx->timeline_count)
++      reply.ret = render_state_export_fence(ctx->ctx_id, req->ring_index, &fd);
++
++   if (fd < 0)
++      return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
++
++   bool ok = render_socket_send_reply_with_fds(&ctx->socket, &reply, sizeof(reply), &fd, 1);
++   close(fd);
++
++   return ok;
++}
++
+ static bool
+ render_context_dispatch_submit_cmd(struct render_context *ctx,
+                                    const union render_context_op_request *request,
+@@ -192,6 +214,7 @@ static const struct render_context_dispatch_entry
+       RENDER_CONTEXT_DISPATCH(DESTROY_RESOURCE, destroy_resource, 0),
+       RENDER_CONTEXT_DISPATCH(SUBMIT_CMD, submit_cmd, 0),
+       RENDER_CONTEXT_DISPATCH(SUBMIT_FENCE, submit_fence, 0),
++      RENDER_CONTEXT_DISPATCH(EXPORT_FENCE, export_fence, 0),
+ #undef RENDER_CONTEXT_DISPATCH
+    };
+ 
+diff --git a/server/render_protocol.h b/server/render_protocol.h
+index 7e38ac0c..97b48698 100644
+--- a/server/render_protocol.h
++++ b/server/render_protocol.h
+@@ -39,6 +39,7 @@ enum render_context_op {
+    RENDER_CONTEXT_OP_DESTROY_RESOURCE,
+    RENDER_CONTEXT_OP_SUBMIT_CMD,
+    RENDER_CONTEXT_OP_SUBMIT_FENCE,
++   RENDER_CONTEXT_OP_EXPORT_FENCE,
+ 
+    RENDER_CONTEXT_OP_COUNT,
+ };
+@@ -208,6 +209,23 @@ struct render_context_op_submit_fence_request {
+    uint32_t seqno;
+ };
+ 
++/* Export a sync_file covering all work submitted to a ring.
++ *
++ * The sync_file signals once everything submitted to the ring so far,
++ * including the fences submitted with RENDER_CONTEXT_OP_SUBMIT_FENCE, has
++ * completed.
++ */
++struct render_context_op_export_fence_request {
++   struct render_context_op_header header;
++   uint32_t ring_index;
++};
++
++struct render_context_op_export_fence_reply {
++   /* 0 on success, negative errno otherwise */
++   int32_t ret;
++   /* followed by 1 sync_file fd if ret == 0 and the work has not completed */
++};
++
+ union render_context_op_request {
+    struct render_context_op_header header;
+    struct render_context_op_nop_request nop;
+@@ -217,6 +235,7 @@ union render_context_op_request {
+    struct render_context_op_destroy_resource_request destroy_resource;
+    struct render_context_op_submit_cmd_request submit_cmd;
+    struct render_context_op_submit_fence_request submit_fence;
++   struct render_context_op_export_fence_request export_fence;
+ };
+ 
+ #endif /* RENDER_PROTOCOL_H */
+diff --git a/server/render_state.c b/server/render_state.c
+index 715f85e6..59c119c4 100644
+--- a/server/render_state.c
++++ b/server/render_state.c
+@@ -213,6 +213,13 @@ render_state_submit_fence(uint32_t ctx_id,
+    return vkr_renderer_submit_fence(ctx_id, flags, ring_idx, fence_id);
+ }
+ 
++int
++render_state_export_fence(uint32_t ctx_id, uint32_t ring_idx, int *out_fd)
++{
++   SCOPE_LOCK_RENDERER();
++   return vkr_renderer_export_fence(ctx_id, ring_idx, out_fd);
++}
++
+ bool
+ render_state_create_resource(uint32_t ctx_id,
+                              uint32_t res_id,
+diff --git a/server/render_state.h b/server/render_state.h
+index 98de2722..df341263 100644
+--- a/server/render_state.h
++++ b/server/render_state.h
+@@ -32,6 +32,9 @@ render_state_submit_fence(uint32_t ctx_id,
+                           uint64_t ring_idx,
+                           uint64_t fence_id);
+ 
++int
++render_state_export_fence(uint32_t ctx_id, uint32_t ring_idx, int *out_fd);
++
+ bool
+ render_state_create_resource(uint32_t ctx_id,
+                              uint32_t res_id,
+diff --git a/src/proxy/proxy_context.c b/src/proxy/proxy_context.c
+index dc23ef58..2660a939 100644
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -247,6 +247,66 @@ proxy_context_submit_fence(struct virgl_context *base,
+    return -1;
+ }
+ 
++static int
++proxy_context_export_fence(struct virgl_context *base,
++                           uint32_t ring_idx,
++                           uint64_t fence_id,
++                           int *out_fd)
++{
++   struct proxy_context *ctx = (struct proxy_context *)base;
++   bool pending = false;
++
++   *out_fd = -1;
++   if (ring_idx >= PROXY_CONTEXT_TIMELINE_COUNT)
++      return -EINVAL;
++
++   /* skip the round trip when the fence is no longer pending */
++   if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++      mtx_lock(&ctx->timeline_mutex);
++
++   const uint32_t cur_seqno = proxy_context_load_timeline_seqno(ctx, ring_idx);
++   list_for_each_entry (struct proxy_fence, fence, &ctx->timelines[ring_idx].fences, head) {
++      if (fence->fence_id == fence_id) {
++         pending = !proxy_fence_is_signaled(fence, cur_seqno);
++         break;
++      }
++   }
++
++   if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++      mtx_unlock(&ctx->timeline_mutex);
++
++   if (!pending)
++      return 0;
++
++   const struct render_context_op_export_fence_request req = {
++      .header.op = RENDER_CONTEXT_OP_EXPORT_FENCE,
++      .ring_index = ring_idx,
++   };
++   if (!proxy_socket_send_request(&ctx->socket, &req, sizeof(req))) {
++      proxy_log("failed to export fence %" PRIu64, fence_id);
++      return -EIO;
++   }
++
++   struct render_context_op_export_fence_reply reply;
++   int reply_fd_count;
++   if (!proxy_socket_receive_reply_with_fds(&ctx->socket, &reply, sizeof(reply), out_fd,
++                                            1, &reply_fd_count)) {
++      proxy_log("failed to get reply of fence export %" PRIu64, fence_id);
++      *out_fd = -1;
++      return -EIO;
++   }
++
++   if (!reply_fd_count)
++      *out_fd = -1;
++
++   if (reply.ret && *out_fd >= 0) {
++      close(*out_fd);
++      *out_fd = -1;
++   }
++
++   return reply.ret;
++}
++
+ static void
+ proxy_context_retire_fences(struct virgl_context *base)
+ {
+@@ -558,6 +618,7 @@ proxy_context_init_base(struct proxy_context *ctx)
+    ctx->base.get_fencing_fd = proxy_context_get_fencing_fd;
+    ctx->base.retire_fences = proxy_context_retire_fences;
+    ctx->base.submit_fence = proxy_context_submit_fence;
++   ctx->base.export_fence = proxy_context_export_fence;
+ }
+ 
+ static bool
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index 4bf526a9..31e74a2c 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -158,6 +158,23 @@ vkr_context_submit_fence(struct vkr_context *ctx,
+    return ok;
+ }
+ 
++int
++vkr_context_export_fence(struct vkr_context *ctx, uint32_t ring_idx, int *out_fd)
++{
++   *out_fd = -1;
++
++   /* fences on the cpu timeline retire on submission */
++   if (ring_idx == 0)
++      return 0;
++
++   if (ring_idx >= ARRAY_SIZE(ctx->sync_queues) || !ctx->sync_queues[ring_idx]) {
++      vkr_log("export_fence: invalid ring_idx %u", ring_idx);
++      return -EINVAL;
++   }
++
++   return vkr_queue_export_sync_fd(ctx->sync_queues[ring_idx], out_fd);
++}
++
+ bool
+ vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size)
+ {
+diff --git a/src/venus/vkr_context.h b/src/venus/vkr_context.h
+index 12541a72..34575d64 100644
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -123,6 +123,9 @@ vkr_context_submit_fence(struct vkr_context *ctx,
+                          uint32_t ring_idx,
+                          uint64_t fence_id);
+ 
++int
++vkr_context_export_fence(struct vkr_context *ctx, uint32_t ring_idx, int *out_fd);
++
+ bool
+ vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size);
+ 
+diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
+index 61b94bef..28c9fb0c 100644
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -111,6 +111,68 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
+    return true;
+ }
+ 
++int
++vkr_queue_export_sync_fd(struct vkr_queue *queue, int *out_fd)
++{
++   TRACE_FUNC();
++   struct vkr_device *dev = queue->device;
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   VkDevice dev_handle = dev->base.handle.device;
++   VkResult result;
++   int ret = 0;
++
++   *out_fd = -1;
++   if (!dev->physical_device->KHR_external_fence_fd)
++      return -ENOTSUP;
++
++   mtx_lock(&queue->vk_mutex);
++
++   if (queue->export_fence == VK_NULL_HANDLE) {
++      const VkExportFenceCreateInfo export_info = {
++         .sType = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO,
++         .handleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
++      };
++      const VkFenceCreateInfo create_info = {
++         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
++         .pNext = &export_info,
++      };
++      result = vk->CreateFence(dev_handle, &create_info, NULL, &queue->export_fence);
++      if (result != VK_SUCCESS) {
++         queue->export_fence = VK_NULL_HANDLE;
++         ret = -ENOMEM;
++         goto out;
++      }
++   }
++
++   /* the fence signals after all work submitted to the queue so far */
++   result = vk->QueueSubmit(queue->base.handle.queue, 0, NULL, queue->export_fence);
++   if (result != VK_SUCCESS) {
++      ret = result == VK_ERROR_DEVICE_LOST ? -ENODEV : -EIO;
++      goto out;
++   }
++
++   /* exporting a SYNC_FD resets the fence, so it can be submitted again */
++   const VkFenceGetFdInfoKHR get_fd_info = {
++      .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
++      .fence = queue->export_fence,
++      .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
++   };
++   result = vk->GetFenceFdKHR(dev_handle, &get_fd_info, out_fd);
++   if (result != VK_SUCCESS) {
++      /* the fence is still pending and must not be submitted again */
++      vk->WaitForFences(dev_handle, 1, &queue->export_fence, VK_TRUE, UINT64_MAX);
++      vk->ResetFences(dev_handle, 1, &queue->export_fence);
++      *out_fd = -1;
++      ret = -EIO;
++   }
++
++out:
++   mtx_unlock(&queue->vk_mutex);
++   if (ret)
++      vkr_log("failed to export sync fd for ring_idx %u (ret %d)", queue->ring_idx, ret);
++   return ret;
++}
++
+ static void
+ vkr_queue_sync_thread_fini(struct vkr_queue *queue)
+ {
+@@ -134,6 +196,11 @@ vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue)
+ {
+    vkr_queue_sync_thread_fini(queue);
+ 
++   if (queue->export_fence != VK_NULL_HANDLE) {
++      queue->device->proc_table.DestroyFence(queue->device->base.handle.device,
++                                             queue->export_fence, NULL);
++   }
++
+    list_del(&queue->base.track_head);
+ 
+    mtx_destroy(&queue->vk_mutex);
+diff --git a/src/venus/vkr_queue.h b/src/venus/vkr_queue.h
+index 6a3a909e..f9257a0e 100644
+--- a/src/venus/vkr_queue.h
++++ b/src/venus/vkr_queue.h
+@@ -48,6 +48,11 @@ struct vkr_queue {
+       thrd_t thread;
+       bool join;
+    } sync_thread;
++
++   /* SYNC_FD exportable fence for vkr_queue_export_sync_fd, protected by
++    * vk_mutex and created on first use
++    */
++   VkFence export_fence;
+ };
+ VKR_DEFINE_OBJECT_CAST(queue, VK_OBJECT_TYPE_QUEUE, VkQueue)
+ 
+@@ -95,4 +100,7 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
+                       uint32_t ring_idx,
+                       uint64_t fence_id);
+ 
++int
++vkr_queue_export_sync_fd(struct vkr_queue *queue, int *out_fd);
++
+ #endif /* VKR_QUEUE_H */
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index c43a96e6..47914452 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -169,6 +169,19 @@ vkr_renderer_submit_fence(uint32_t ctx_id,
+    return vkr_context_submit_fence(ctx, flags, ring_idx, fence_id);
+ }
+ 
++int
++vkr_renderer_export_fence(uint32_t ctx_id, uint32_t ring_idx, int *out_fd)
++{
++   TRACE_FUNC();
++
++   *out_fd = -1;
++   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
++   if (!ctx)
++      return -EINVAL;
++
++   return vkr_context_export_fence(ctx, ring_idx, out_fd);
++}
++
+ bool
+ vkr_renderer_create_resource(uint32_t ctx_id,
+                              uint32_t res_id,
+diff --git a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
+index be3ae046..8ca5c437 100644
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -53,6 +53,9 @@ vkr_renderer_submit_fence(uint32_t ctx_id,
+                           uint64_t ring_idx,
+                           uint64_t fence_id);
+ 
++int
++vkr_renderer_export_fence(uint32_t ctx_id, uint32_t ring_idx, int *out_fd);
++
+ bool
+ vkr_renderer_create_resource(uint32_t ctx_id,
+                              uint32_t res_id,
+diff --git a/src/virgl_context.h b/src/virgl_context.h
+index 25bc1060..905cf38f 100644
+--- a/src/virgl_context.h
++++ b/src/virgl_context.h
+@@ -129,6 +129,14 @@ struct virgl_context {
+                        uint32_t ring_idx,
+                        uint64_t fence_id);
+ 
++   /* Export a sync_file for a fence submitted with submit_fence.  Sets
++    * *out_fd to -1 when the fence has already signaled.  Optional.
++    */
++   int (*export_fence)(struct virgl_context *ctx,
++                       uint32_t ring_idx,
++                       uint64_t fence_id,
++                       int *out_fd);
++
+    /* For DRM native contexts, return the device fd: */
+    int (*get_device_fd)(struct virgl_context *ctx);
+ 
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 79717fcc..fe17a6e5 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -435,6 +435,23 @@ int virgl_renderer_context_create_fence(uint32_t ctx_id,
+    return ctx->submit_fence(ctx, flags, ring_idx, fence_id);
+ }
+ 
++int virgl_renderer_context_export_fence(uint32_t ctx_id,
++                                        uint32_t ring_idx,
++                                        uint64_t fence_id,
++                                        int *out_fd)
++{
++   TRACE_FUNC();
++   struct virgl_context *ctx = virgl_context_lookup(ctx_id);
++   if (!ctx)
++      return -EINVAL;
++
++   *out_fd = -1;
++   if (!ctx->export_fence)
++      return -ENOTSUP;
++
++   return ctx->export_fence(ctx, ring_idx, fence_id, out_fd);
++}
++
+ void virgl_renderer_context_poll(uint32_t ctx_id)
+ {
+    TRACE_FUNC();
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+index 0bcafef4..27527221 100644
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -515,6 +515,16 @@ VIRGL_EXPORT int virgl_renderer_attach_fence(int ctx_id, int fence_fd);
+ VIRGL_EXPORT int virgl_renderer_get_fence_fd(uint64_t fence_id);
+ VIRGL_EXPORT int virgl_renderer_get_dev_fd(int ctx_id);
+ 
++/* Export a sync_file that signals once the fence (ring_idx, fence_id),
++ * submitted with virgl_renderer_context_create_fence, has signaled.  On
++ * success *out_fd is a new sync_file, or -1 if the fence has already
++ * signaled.  Returns -ENOTSUP if the context cannot export fences.
++ */
++VIRGL_EXPORT int virgl_renderer_context_export_fence(uint32_t ctx_id,
++                                                     uint32_t ring_idx,
++                                                     uint64_t fence_id,
++                                                     int *out_fd);
++
+ #endif /* VIRGL_RENDERER_UNSTABLE_APIS */
+ 
+ #endif
+diff --git a/vtest/vtest.h b/vtest/vtest.h
+index f6bf4f47..f982ea4c 100644
+--- a/vtest/vtest.h
++++ b/vtest/vtest.h
+@@ -119,6 +119,9 @@ int vtest_resource_import_blob(uint32_t length_dw);
+ /* since protocol version 6 */
+ int vtest_alloc_dmabuf_image(uint32_t length_dw);
+ 
++/* since protocol version 7 */
++int vtest_sync_export_fd(uint32_t length_dw);
++
+ void vtest_set_max_length(uint32_t length);
+ 
+ #endif
+diff --git a/vtest/vtest_protocol.h b/vtest/vtest_protocol.h
+index 5fcf521a..fe67018f 100644
+--- a/vtest/vtest_protocol.h
++++ b/vtest/vtest_protocol.h
+@@ -27,7 +27,7 @@
+ 
+ #define VTEST_DEFAULT_SOCKET_NAME "/tmp/.virgl_test"
+ 
+-#define VTEST_PROTOCOL_VERSION 6
++#define VTEST_PROTOCOL_VERSION 7
+ 
+ /* 32-bit length field */
+ /* 32-bit cmd field */
+@@ -100,6 +100,9 @@
+ /* since protocol version 6 */
+ #define VCMD_ALLOC_DMABUF_IMAGE 40
+ 
++/* since protocol version 7 */
++#define VCMD_SYNC_EXPORT_FD 41
++
+ #define VCMD_RES_CREATE_SIZE 10
+ #define VCMD_RES_CREATE_RES_HANDLE 0 /* must be 0 since protocol version 3 */
+ #define VCMD_RES_CREATE_TARGET 1
+@@ -398,4 +401,30 @@ enum vcmd_alloc_dmabuf_image_flag {
+ #define VCMD_ALLOC_DMABUF_IMAGE_RESP_SIZE_HI 6
+ /* rsp fd (SCM_RIGHTS) only when ERROR == 0 */
+ 
++/* Export a sync_file that signals once the GPU work that will signal
++ * (sync id, value) has completed.
++ *
++ * The server finds the pending submit that signals the sync to at least
++ * value and asks the context to export a sync_file for that submit's ring.
++ * The sync_file covers all work submitted to the ring so far, so it may
++ * signal later than strictly needed but never earlier.
++ */
++#define VCMD_SYNC_EXPORT_FD_SIZE 3
++#define VCMD_SYNC_EXPORT_FD_ID 0
++#define VCMD_SYNC_EXPORT_FD_VALUE_LO 1
++#define VCMD_SYNC_EXPORT_FD_VALUE_HI 2
++
++enum vcmd_sync_export_fd_status {
++   /* the sync already reached value: no fd, use -1 */
++   VCMD_SYNC_EXPORT_FD_SIGNALED = 0,
++   /* a sync_file fd follows (SCM_RIGHTS) */
++   VCMD_SYNC_EXPORT_FD_FD = 1,
++   /* no pending submit signals the sync or the context cannot export:
++    * the client has to wait for the sync on the CPU
++    */
++   VCMD_SYNC_EXPORT_FD_UNAVAILABLE = 2,
++};
++#define VCMD_SYNC_EXPORT_FD_RESP_SIZE 1
++#define VCMD_SYNC_EXPORT_FD_RESP_STATUS 0
++
+ #endif /* VTEST_PROTOCOL */
+diff --git a/vtest/vtest_renderer.c b/vtest/vtest_renderer.c
+index f4cb0521..8e073d84 100644
+--- a/vtest/vtest_renderer.c
++++ b/vtest/vtest_renderer.c
+@@ -330,8 +330,10 @@ static void vtest_unref_sync(struct vtest_sync *sync)
+ static void vtest_free_timeline_submit(struct vtest_timeline_submit *submit)
+ {
+    uint32_t i;
+-   for (i = 0; i < submit->count; i++)
+-      vtest_unref_sync(submit->syncs[i]);
++   for (i = 0; i < submit->count; i++) {
++      if (submit->syncs[i])
++         vtest_unref_sync(submit->syncs[i]);
++   }
+    free(submit);
+ }
+ 
+@@ -1966,6 +1968,9 @@ static void vtest_signal_timeline(struct vtest_timeline *timeline,
+       list_del(&submit->head);
+ 
+       for (i = 0; i < submit->count; i++) {
++         /* NULL when the sync was exported as a sync_file */
++         if (!submit->syncs[i])
++            continue;
+          vtest_signal_sync(submit->syncs[i], submit->values[i]);
+          vtest_unref_sync(submit->syncs[i]);
+       }
+@@ -3197,6 +3202,110 @@ int vtest_alloc_dmabuf_image(uint32_t length_dw)
+    return ret < 0 ? ret : 0;
+ }
+ 
++static struct vtest_timeline_submit *
++vtest_find_pending_submit(struct vtest_context *ctx,
++                          const struct vtest_sync *sync,
++                          uint64_t value,
++                          uint32_t *out_ring_idx)
++{
++   for (uint32_t ring_idx = 0; ring_idx < VTEST_MAX_TIMELINE_COUNT; ring_idx++) {
++      struct vtest_timeline *timeline = &ctx->timelines[ring_idx];
++      struct vtest_timeline_submit *submit;
++
++      /* submits retire in order, so the first match is the earliest */
++      LIST_FOR_EACH_ENTRY(submit, &timeline->submits, head) {
++         for (uint32_t i = 0; i < submit->count; i++) {
++            if (submit->syncs[i] == sync && submit->values[i] >= value) {
++               *out_ring_idx = ring_idx;
++               return submit;
++            }
++         }
++      }
++   }
++
++   return NULL;
++}
++
++/* Exporting a sync_file transfers the payload, and the client resets the
++ * sync right after.  Pending submits must then no longer signal the sync,
++ * or a later reuse of it would see a stale signal.
++ */
++static void vtest_detach_pending_sync(struct vtest_context *ctx,
++                                      struct vtest_sync *sync)
++{
++   for (uint32_t ring_idx = 0; ring_idx < VTEST_MAX_TIMELINE_COUNT; ring_idx++) {
++      struct vtest_timeline_submit *submit;
++
++      LIST_FOR_EACH_ENTRY(submit, &ctx->timelines[ring_idx].submits, head) {
++         for (uint32_t i = 0; i < submit->count; i++) {
++            if (submit->syncs[i] == sync) {
++               vtest_unref_sync(sync);
++               submit->syncs[i] = NULL;
++            }
++         }
++      }
++   }
++}
++
++int vtest_sync_export_fd(UNUSED uint32_t length_dw)
++{
++   struct vtest_context *ctx = vtest_get_current_context();
++   uint32_t req_buf[VCMD_SYNC_EXPORT_FD_SIZE];
++   uint32_t resp_buf[VTEST_HDR_SIZE + VCMD_SYNC_EXPORT_FD_RESP_SIZE];
++   struct vtest_timeline_submit *submit;
++   struct vtest_sync *sync;
++   uint32_t status;
++   uint32_t ring_idx;
++   uint64_t value;
++   int fd = -1;
++   int ret;
++
++   ret = ctx->input->read(ctx->input, req_buf, sizeof(req_buf));
++   if (ret != sizeof(req_buf))
++      return -1;
++
++   sync = util_hash_table_get(ctx->sync_table,
++                              intptr_to_pointer(req_buf[VCMD_SYNC_EXPORT_FD_ID]));
++   if (!sync)
++      return -EEXIST;
++
++   value = req_buf[VCMD_SYNC_EXPORT_FD_VALUE_LO] |
++           (uint64_t)req_buf[VCMD_SYNC_EXPORT_FD_VALUE_HI] << 32;
++
++   if (sync->value >= value) {
++      status = VCMD_SYNC_EXPORT_FD_SIGNALED;
++   } else {
++      submit = vtest_find_pending_submit(ctx, sync, value, &ring_idx);
++      if (!submit) {
++         status = VCMD_SYNC_EXPORT_FD_UNAVAILABLE;
++      } else {
++         ret = virgl_renderer_context_export_fence(ctx->ctx_id, ring_idx,
++                                                   (uintptr_t)submit, &fd);
++         if (ret)
++            status = VCMD_SYNC_EXPORT_FD_UNAVAILABLE;
++         else if (fd < 0)
++            status = VCMD_SYNC_EXPORT_FD_SIGNALED;
++         else
++            status = VCMD_SYNC_EXPORT_FD_FD;
++      }
++   }
++
++   if (status != VCMD_SYNC_EXPORT_FD_UNAVAILABLE)
++      vtest_detach_pending_sync(ctx, sync);
++
++   resp_buf[VTEST_CMD_LEN] = VCMD_SYNC_EXPORT_FD_RESP_SIZE;
++   resp_buf[VTEST_CMD_ID] = VCMD_SYNC_EXPORT_FD;
++   resp_buf[VTEST_CMD_DATA_START + VCMD_SYNC_EXPORT_FD_RESP_STATUS] = status;
++
++   ret = vtest_block_write(ctx->out_fd, resp_buf, sizeof(resp_buf));
++   if (ret >= 0 && fd >= 0)
++      ret = vtest_send_fd(ctx->out_fd, fd);
++   if (fd >= 0)
++      close(fd);
++
++   return ret < 0 ? ret : 0;
++}
++
+ void vtest_set_max_length(uint32_t length)
+ {
+    renderer.max_length = length;
+diff --git a/vtest/vtest_server.c b/vtest/vtest_server.c
+index 1bee25b1..14a6ffb0 100644
+--- a/vtest/vtest_server.c
++++ b/vtest/vtest_server.c
+@@ -736,6 +736,9 @@ static const struct vtest_command {
+ 
+    /* since protocol version 6 */
+    HANDLER(ALLOC_DMABUF_IMAGE,          alloc_dmabuf_image,        false  ),
++
++   /* since protocol version 7 */
++   HANDLER(SYNC_EXPORT_FD,              sync_export_fd,            true   ),
+ };
+ 
+ static int vtest_client_dispatch_commands(struct vtest_client *client)
+-- 
+2.56.0
+

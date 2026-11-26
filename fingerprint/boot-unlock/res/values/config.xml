@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Android normally wants the screen lock credential once after every boot before a
+         fingerprint may unlock. Off, so fp.sh touch can unlock a freshly started Waydroid. -->
+    <bool name="config_strongAuthRequiredOnBoot">false</bool>
+</resources>

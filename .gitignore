@@ -1,0 +1,19 @@
+# upstream sources: the build scripts clone them and apply venus/patches
+/src/*
+!/src/minigbm-vtest/
+!/src/minigbm-wrapper/
+/src/minigbm-vtest/build-android/
+/src/minigbm-wrapper/minigbm/
+/src/minigbm-wrapper/out/
+# built release payload (release/build.sh regenerates it)
+/release/dist/
+# test binaries and logs
+/venus/tests/build/
+/venus/hwc-yuv/build/
+/venus/hwc-yuv/out/
+/venus/mapper-yv12/build/
+/venus/cursor/build/
+# logs and measurement output
+*.txt
+# image backups
+/backups/*.img*

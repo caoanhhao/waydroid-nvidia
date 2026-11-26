@@ -1,0 +1,18 @@
+[constants]
+ndk_path = '/opt/android-ndk'
+toolchain = ndk_path / 'toolchains/llvm/prebuilt/linux-x86_64/bin'
+
+[binaries]
+ar = toolchain / 'llvm-ar'
+c = [toolchain / 'x86_64-linux-android33-clang']
+cpp = [toolchain / 'x86_64-linux-android33-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '--start-no-unused-arguments', '-static-libstdc++', '--end-no-unused-arguments']
+c_ld = 'lld'
+cpp_ld = 'lld'
+strip = toolchain / 'llvm-strip'
+pkg-config = 'false'
+
+[host_machine]
+system = 'android'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

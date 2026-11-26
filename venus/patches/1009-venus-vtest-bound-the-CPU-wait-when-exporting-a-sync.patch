@@ -1,0 +1,64 @@
+From c384405ebf40edcf7004f8e34d664fd1f54ca591 Mon Sep 17 00:00:00 2001
+From: caoanhhao <caoanhhao2@gmail.com>
+Date: Sat, 7 Nov 2026 07:37:54 +0700
+Subject: [PATCH] venus/vtest: bound the CPU wait when exporting a sync fd
+
+vtest_sync_export_syncobj (patch 0001) waited for the sync with no
+timeout. When the render server drops a context after a CS error (seen
+at boot: "failed to look up object N of type 8" in vkBindImageMemory2),
+the sync never signals and the caller hangs in vkQueuePresentKHR. A hung
+bootanimation kept its layer on top of the whole UI after boot.
+
+Wait at most 5 s and hand out -1 anyway. The next submit then finds the
+fatal ring and aborts, so the process dies instead of hanging.
+
+caoanhhao used AI to code
+---
+ src/virtio/vulkan/vn_renderer_vtest.c | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/src/virtio/vulkan/vn_renderer_vtest.c b/src/virtio/vulkan/vn_renderer_vtest.c
+index dccea65..ae58c23 100644
+--- a/src/virtio/vulkan/vn_renderer_vtest.c
++++ b/src/virtio/vulkan/vn_renderer_vtest.c
+@@ -31,6 +31,9 @@
+ /* VCMD_RESOURCE_IMPORT_BLOB */
+ #define VTEST_DMA_BUF_IMPORT_PROTOCOL_VERSION 5
+ 
++/* how long vtest_sync_export_syncobj waits for the GPU before giving up */
++#define VTEST_SYNC_EXPORT_TIMEOUT_NS (5ull * 1000 * 1000 * 1000)
++
+ struct vtest;
+ 
+ struct vtest_shmem {
+@@ -990,15 +993,25 @@ vtest_sync_export_syncobj(struct vn_renderer *renderer,
+    /* vtest has no sync_file side channel.  Wait for the sync to be signaled
+     * (exportable syncs are signaled with value 1 on submit) and hand out -1,
+     * which is a valid sync file referring to an already signaled object.
++    *
++    * The wait is bounded: when the server drops the context after a CS
++    * error, the sync never signals, and an unbounded wait here hangs the
++    * caller inside vkQueuePresentKHR forever (a stuck bootanimation covered
++    * the whole UI).  Giving up lets the next submit see the dead ring.
+     */
+    const uint64_t val = 1;
+    const struct vn_renderer_wait wait = {
+-      .timeout = UINT64_MAX,
++      .timeout = VTEST_SYNC_EXPORT_TIMEOUT_NS,
+       .syncs = &sync,
+       .sync_values = &val,
+       .sync_count = 1,
+    };
+-   vtest_wait(renderer, &wait);
++   const VkResult result = vtest_wait(renderer, &wait);
++   if (result != VK_SUCCESS) {
++      struct vtest *vtest = (struct vtest *)renderer;
++      vn_log(vtest->instance,
++             "sync export wait failed (%d), not waiting further", result);
++   }
+ 
+    return -1;
+ }
+-- 
+2.56.0
+

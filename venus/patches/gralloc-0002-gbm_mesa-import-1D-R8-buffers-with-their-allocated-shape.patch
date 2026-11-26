@@ -1,0 +1,67 @@
+From ede953d0d008d102050cd4902101e77dbf33b259 Mon Sep 17 00:00:00 2001
+From: caoanhhao <caoanhhao2@gmail.com>
+Date: Fri, 6 Nov 2026 12:57:50 +0700
+Subject: [PATCH] gbm_mesa: import and map 1D R8 buffers with their allocated
+ shape
+
+gbm_mesa_bo_create allocates 1D R8 buffers (HAL BLOB, spoofed formats)
+as a 4096-wide 2D texture, but gbm_mesa_bo_import imports them as
+total_size x 1. Mesa rejects that (width over the texture limit, stride
+below the width), so every CPU lock of a BLOB failed and the external
+camera HAL could not write JPEG output. Reshape such imports and maps to
+4096 x ceil(total_size / 4096).
+
+caoanhhao used AI to code
+---
+ gbm_mesa_driver/gbm_mesa_wrapper.cpp | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/gbm_mesa_driver/gbm_mesa_wrapper.cpp b/gbm_mesa_driver/gbm_mesa_wrapper.cpp
+index 8f63da4..ebdb0c9 100644
+--- a/gbm_mesa_driver/gbm_mesa_wrapper.cpp
++++ b/gbm_mesa_driver/gbm_mesa_wrapper.cpp
+@@ -279,12 +279,30 @@ static int gbm_mesa_alloc(struct alloc_args *args)
+ 	return 0;
+ }
+ 
++/* gbm_mesa_bo_create allocates 1D R8 buffers (HAL BLOB, spoofed formats) as a 4096-wide 2D
++ * texture, but gbm_mesa_bo_import imports them as total_size x 1, which no mesa driver accepts
++ * (width over the texture limit, stride below the width), so every CPU lock of a BLOB failed
++ * (camera JPEG output). Import and map them with the shape they were allocated with. */
++#define R8_1D_WIDTH 4096
++
++static void reshape_1d_r8(uint32_t drm_format, uint32_t *width, uint32_t *height,
++			  uint32_t *stride)
++{
++	if (drm_format != DRM_FORMAT_R8 || *height != 1 || *width <= R8_1D_WIDTH)
++		return;
++	*height = (*width + R8_1D_WIDTH - 1) / R8_1D_WIDTH;
++	*width = R8_1D_WIDTH;
++	if (stride)
++		*stride = R8_1D_WIDTH;
++}
++
+ // MAPPER ONLY!
+ static struct gbm_bo *gbm_import(struct gbm_device *gbm, int buf_fd, uint32_t width,
+ 				 uint32_t height, uint32_t stride, uint64_t modifier,
+ 				 uint32_t drm_format)
+ {
+ 	struct gbm_bo *bo = NULL;
++	reshape_1d_r8(drm_format, &width, &height, &stride);
+ 	struct gbm_import_fd_modifier_data data = {
+ 		.width = width,
+ 		.height = height,
+@@ -310,7 +328,9 @@ static void gbm_map(struct gbm_bo *bo, int w, int h, void **addr, void **map_dat
+ 	int flags = GBM_BO_TRANSFER_READ | GBM_BO_TRANSFER_WRITE;
+ 
+ 	uint32_t stride = 0;
+-	*addr = gbm_bo_map(bo, 0, 0, w, h, flags, &stride, map_data);
++	uint32_t uw = w, uh = h;
++	reshape_1d_r8(gbm_bo_get_format(bo) == GBM_FORMAT_R8 ? DRM_FORMAT_R8 : 0, &uw, &uh, NULL);
++	*addr = gbm_bo_map(bo, 0, 0, uw, uh, flags, &stride, map_data);
+ 	if (*addr == NULL) {
+ 		*addr = MAP_FAILED;
+ 		ALOGE("Failed to map the buffer at %s:%d", __FILE__, __LINE__);
+-- 
+2.56.0
+

@@ -1,0 +1,4 @@
+{
+	global: get_gbm_ops; gbm_ops;
+	local: *;
+};

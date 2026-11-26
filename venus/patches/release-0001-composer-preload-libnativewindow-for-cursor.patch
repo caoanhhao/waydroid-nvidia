@@ -1,0 +1,47 @@
+diff -ru a/release/build.sh b/release/build.sh
+--- a/release/build.sh	2026-11-05 14:21:05.916964104 +0700
++++ b/release/build.sh	2026-11-05 14:21:05.967394248 +0700
+@@ -13,6 +13,7 @@
+ cp "$ROOT/src/mesa/build-android/src/virtio/vulkan/libvulkan_virtio.so" "$D/android/vulkan.virtio.so"
+ cp "$ROOT/src/minigbm-vtest/build-android/libgbm_mesa_wrapper.so" "$D/android/libgbm_mesa_wrapper.so"
+ cp "$ROOT/src/minigbm-wrapper/out/libgbm_mesa_wrapper.so" "$D/android/libgbm_mesa_wrapper_intel.so"
++cp "$ROOT/venus/cursor/zz-waydroid-hwcomposer-nativewindow.rc" "$D/android/"
+ 
+ cp "$VB/vtest/virgl_test_server" "$VB/server/virgl_render_server" "$D/host/bin/"
+ # only the runtime soname link and the library (not the .so dev link or meson's .p dir)
+diff -ru a/release/install.sh b/release/install.sh
+--- a/release/install.sh	2026-11-05 14:21:05.916987707 +0700
++++ b/release/install.sh	2026-11-05 14:21:05.967437526 +0700
+@@ -66,6 +66,9 @@
+     install -D -m644 "$D/android/vulkan.virtio.so" "$LIB/hw/vulkan.virtio.so"
+     install -D -m644 "$D/android/libgbm_mesa_wrapper.so" "$LIB/libgbm_mesa_wrapper.so"
+     install -D -m644 "$D/android/libgbm_mesa_wrapper_intel.so" "$LIB/libgbm_mesa_wrapper_intel.so"
++    # composer: preload libnativewindow so ANGLE's EGL image import works there
++    install -D -m644 "$D/android/zz-waydroid-hwcomposer-nativewindow.rc" \
++        /var/lib/waydroid/overlay/vendor/etc/init/zz-waydroid-hwcomposer-nativewindow.rc
+     sed -i 's/^mount_overlays = .*/mount_overlays = True/' "$CFG"
+ 
+     # Vulkan: Venus over the vtest socket (host waydroid-vtest.service)
+@@ -79,8 +82,9 @@
+     set_prop gralloc.gbm.linear 1
+     set_prop waydroid.gralloc.vtest 1
+     set_prop debug.hwui.renderer skiavk
+-    # cursor as dma-buf: the composer's EGL path crashes under ANGLE (see README)
+-    set_prop persist.waydroid.cursor_force_shm true
++    # cursor through the composer's EGL readback into shm (the .rc above fixes
++    # its crash); a dma-buf cursor is a LINEAR buffer Hyprland/NVIDIA cannot show
++    del_prop persist.waydroid.cursor_force_shm
+     # leftovers from debugging
+     for p in mesa.vn.debug ro.logd.size debug.renderengine.backend debug.mesa.log.level; do
+         del_prop "$p"
+diff -ru a/release/uninstall.sh b/release/uninstall.sh
+--- a/release/uninstall.sh	2026-11-05 14:21:05.917003853 +0700
++++ b/release/uninstall.sh	2026-11-05 14:21:05.967463631 +0700
+@@ -13,6 +13,7 @@
+     [ "$(id -u)" = 0 ] || { echo "run with sudo: sudo sh $0 --system" >&2; exit 1; }
+     waydroid session stop 2>/dev/null || true
+     rm -f "$LIB/hw/vulkan.virtio.so" "$LIB/libgbm_mesa_wrapper.so" "$LIB/libgbm_mesa_wrapper_intel.so"
++    rm -f /var/lib/waydroid/overlay/vendor/etc/init/zz-waydroid-hwcomposer-nativewindow.rc
+     for p in ro.hardware.vulkan mesa.vtest.socket.name gralloc.gbm.linear waydroid.gralloc.vtest \
+              debug.hwui.renderer persist.waydroid.cursor_force_shm mesa.vn.debug ro.logd.size \
+              debug.renderengine.backend debug.mesa.log.level ro.hardware.egl; do

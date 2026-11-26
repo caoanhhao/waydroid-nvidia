@@ -1,0 +1,25 @@
+# Waydroid hwcomposer: preload libnativewindow so ANGLE can import EGL images.
+#
+# Android 13 ANGLE resolves AHardwareBuffer_acquire/describe/release with
+# dlsym(dlopen(NULL)) (AHBFunctions.cpp), which only searches the executable's
+# own dependency tree.  composer@2.1-service does not link libnativewindow
+# (libui comes in later through dlopen of hwcomposer.waydroid.so), so the
+# lookups return NULL, every eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID) in
+# the composer fails, and ANGLE's error path calls the NULL release and
+# segfaults.  The composer reaches that path for every shm cursor image
+# (persist.waydroid.cursor_force_shm=false) and for inactive-window snapshots.
+#
+# Installed as /vendor/etc/init/zz-waydroid-hwcomposer-nativewindow.rc through
+# the Waydroid overlay.  init parses /system/etc/init before /vendor/etc/init
+# and sorts each directory, so this "override" replaces both the stock vendor
+# definition and the one in /system/etc/init/init.waydroid.rc.  Everything
+# except setenv is copied from init.waydroid.rc (LineageOS 20 Waydroid image).
+service vendor.hwcomposer-2-1 /vendor/bin/hw/android.hardware.graphics.composer@2.1-service --desktop_file_hint=Waydroid.desktop
+    override
+    class hal animation
+    user host
+    group system graphics drmrpc
+    capabilities SYS_NICE
+    setenv LD_PRELOAD libnativewindow.so
+    onrestart restart surfaceflinger
+    task_profiles ServiceCapacityLow
